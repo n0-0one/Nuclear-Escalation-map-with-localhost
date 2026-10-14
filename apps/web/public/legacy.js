@@ -1,0 +1,5066 @@
+const ntlUnitMarkers = new Map();
+
+    const MAP_IMAGE = "map_4k.png";
+    const TOPOGRAPHIC_IMAGE = "topographic_map.webp";
+    const TERRAIN_HEIGHT_IMAGE = "terrain_height_16bit.webp";
+    const CITY_TOPOGRAPHIC_IMAGE = "generated/southeastern_city_heightmap/southeastern_city_topography.webp";
+    const CITY_TERRAIN_HEIGHT_IMAGE = "generated/southeastern_city_heightmap/southeastern_city_height_16bit.webp";
+    const IMG_SIZE = 4096;
+    const LOS_GRID_SIZE = 256;
+    // Threat coverage sweeps every emitter across the whole map. Work grows
+    // with the square of range in cells, so cells are a fixed 512 m on every
+    // map (512 cells on Archipelago, 256 on the smaller City) to stay
+    // interactive.
+    const THREAT_CELL_METERS = 512;
+    const CITY_MAP_IMAGE = "air_south_eastern_city_map.png";
+    const MAP_DEFINITIONS = {
+        archipelago: {
+            id: "archipelago",
+            label: "Archipelago",
+            image: MAP_IMAGE,
+            variants: ["standard", "mirror"],
+            defaultVariant: "standard",
+            mirroredVariant: "mirror",
+            supportsTeamSwap: true,
+            supportsTerrain: true,
+            terrainImage: TERRAIN_HEIGHT_IMAGE,
+            terrainOverlay: TOPOGRAPHIC_IMAGE,
+            // Decoding parameters are refreshed from terrain_meta.json (written
+            // by tools/extract_heightmap.py); these are the shipped values.
+            terrainMeta: "terrain_meta.json",
+            terrainEncoding: { format: "rg16", min_m: -31, step_m: 0.25 },
+            terrainDisplayRange: [-30, 4970],
+            // The tactical map's coastline sits at 0 m in the HM2 data, even
+            // though air_archipelago.blkx carries a legacy water_level of 80.
+            waterLevel: 0,
+            supportsRoads: true,
+            supportsNavmesh: false,
+            roadFile: "road_network.json",
+            mapCoord0: [-131072, -131072],
+            mapCoord1: [131072, 131072]
+        },
+        city: {
+            id: "city",
+            label: "South Eastern City",
+            image: CITY_MAP_IMAGE,
+            variants: ["city", "city_mirror"],
+            defaultVariant: "city",
+            mirroredVariant: "city_mirror",
+            supportsTeamSwap: true,
+            supportsTerrain: true,
+            terrainImage: CITY_TERRAIN_HEIGHT_IMAGE,
+            terrainOverlay: CITY_TOPOGRAPHIC_IMAGE,
+            terrainMeta: "generated/southeastern_city_heightmap/southeastern_city_height_meta.json",
+            terrainEncoding: { format: "rg16", min_m: -51, step_m: 0.25 },
+            terrainDisplayRange: [-50, 1232],
+            // air_south_eastern_city.blkx: water_level 0.
+            waterLevel: 0,
+            supportsRoads: true,
+            supportsNavmesh: true,
+            roadFile: "road_network_city.json",
+            navmeshFile: "navmesh_city.json",
+            // From air_south_eastern_city.blkx: this map is half the width
+            // of Archipelago, not a 262 km square.
+            mapCoord0: [-65536, -65536],
+            mapCoord1: [65536, 65536]
+        }
+    };
+    // Map, scenario, side, icon and drawer choices persist between visits under one
+    // namespaced key. Storage may be blocked or throw, and stored values may
+    // be stale after a data update, so every consumer validates its field and
+    // silently falls back to the default.
+    const uiStateStorageKey = "ntmap.ui.v1";
+    function readUiState() {
+        try {
+            const value = JSON.parse(localStorage.getItem(uiStateStorageKey));
+            return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+        } catch (error) {
+            return {};
+        }
+    }
+    const uiState = readUiState();
+    // Phones cannot fit the controls, layer drawer and legend side by side.
+    // Without a saved choice, the layer drawer and legend start collapsed
+    // there; a saved choice always wins.
+    const narrowViewport = window.matchMedia?.("(max-width: 700px)").matches === true;
+    function drawerStartsCollapsed(saved) {
+        return typeof saved === "boolean" ? saved : narrowViewport;
+    }
+    function saveUiState(changes) {
+        Object.assign(uiState, changes);
+        try {
+            // Merge with the stored copy so other open tabs' fields survive.
+            localStorage.setItem(
+                uiStateStorageKey,
+                JSON.stringify({ ...readUiState(), ...changes })
+            );
+        } catch (error) {
+            // Ignore: the choice simply is not remembered.
+        }
+    }
+    // NATO symbols match the game's standard tactical map and stay the
+    // default until another family is chosen.
+    let iconFamily = ["vanilla", "pact"].includes(uiState.iconFamily)
+        ? uiState.iconFamily
+        : "nato";
+    let currentMapId = Object.keys(MAP_DEFINITIONS).includes(uiState.map)
+        ? uiState.map
+        : "archipelago";
+
+    function activeMapDefinition() {
+        return MAP_DEFINITIONS[currentMapId] || MAP_DEFINITIONS.archipelago;
+    }
+
+    function worldToLatLng(x, z) {
+        const definition = activeMapDefinition();
+        const [minX, minZ] = definition.mapCoord0;
+        const [maxX, maxZ] = definition.mapCoord1;
+        const px = (x - minX) / (maxX - minX) * IMG_SIZE;
+        const py = (z - minZ) / (maxZ - minZ) * IMG_SIZE;
+        return [py, px];
+    }
+
+    function worldRadiusToMapRadius(radiusMeters) {
+        const definition = activeMapDefinition();
+        return radiusMeters / (
+            (definition.mapCoord1[0] - definition.mapCoord0[0]) / IMG_SIZE
+        );
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? "")
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+    }
+
+    function displayName(value) {
+        const raw = String(value ?? "unit").replaceAll("\\", "/").toLowerCase();
+        const tail = raw.split("/").pop();
+        const localized = globalUnitDisplayNames[raw] || globalUnitDisplayNames[tail];
+        if (localized) return localized;
+        // Mission identifiers carry the nation and often an `ai` marker;
+        // those are useful for data lookup but noisy in user-facing labels.
+        const withoutCountry = tail.replace(
+            /^(ussr|us|germ|sw|jp|it|cn|uk|fr|isr|swe|fin|pl|cs|hu|ro|za|il|ch|sp|ge|av|ukr|tur)_/i,
+            ""
+        );
+        return withoutCountry
+            .replace(/^ai_/i, "")
+            .replace(/_ai(?=_|$)/ig, "")
+            .replaceAll("_", " ");
+    }
+
+    const bounds = [[0, 0], [IMG_SIZE, IMG_SIZE]];
+    const map = L.map("map", {
+        crs: L.CRS.Simple,
+        minZoom: -3,
+        maxZoom: 6,
+        zoomSnap: 0.25,
+        zoomControl: false
+    });
+
+    const infoPanel = document.querySelector(".info-panel");
+    const infoDrawerToggle = document.createElement("button");
+    infoDrawerToggle.type = "button";
+    infoDrawerToggle.className = "drawer-toggle";
+    infoDrawerToggle.setAttribute("aria-label", "Collapse left controls");
+    infoDrawerToggle.setAttribute("aria-expanded", "true");
+    infoDrawerToggle.textContent = "‹";
+    function setInfoPanelCollapsed(collapsed) {
+        infoPanel.classList.toggle("is-collapsed", collapsed);
+        infoDrawerToggle.textContent = collapsed ? "›" : "‹";
+        infoDrawerToggle.setAttribute("aria-expanded", String(!collapsed));
+        infoDrawerToggle.setAttribute(
+            "aria-label",
+            collapsed ? "Expand left controls" : "Collapse left controls"
+        );
+    }
+    infoDrawerToggle.addEventListener("click", () => {
+        const collapsed = !infoPanel.classList.contains("is-collapsed");
+        setInfoPanelCollapsed(collapsed);
+        saveUiState({ controlsCollapsed: collapsed });
+    });
+    infoPanel.appendChild(infoDrawerToggle);
+    setInfoPanelCollapsed(uiState.controlsCollapsed === true);
+
+    const compositionWindow = document.getElementById("composition-window");
+    const compositionWindowToggle = document.getElementById("composition-window-toggle");
+    function setCompositionWindowCollapsed(collapsed) {
+        compositionWindow.classList.toggle("is-collapsed", collapsed);
+        compositionWindowToggle.textContent = collapsed ? "‹" : "›";
+        compositionWindowToggle.setAttribute("aria-expanded", String(!collapsed));
+        compositionWindowToggle.setAttribute(
+            "aria-label",
+            collapsed ? "Expand map legend" : "Collapse map legend"
+        );
+    }
+    compositionWindowToggle.addEventListener("click", () => {
+        const collapsed = !compositionWindow.classList.contains("is-collapsed");
+        setCompositionWindowCollapsed(collapsed);
+        saveUiState({ legendCollapsed: collapsed });
+    });
+    setCompositionWindowCollapsed(drawerStartsCollapsed(uiState.legendCollapsed));
+
+    const standardMapLayer = L.imageOverlay(activeMapDefinition().image, bounds).addTo(map);
+    const topographicMapLayer = L.imageOverlay(
+        activeMapDefinition().terrainOverlay,
+        bounds
+    );
+    map.fitBounds(bounds);
+
+    let terrainReadoutReady = false;
+    // Decoded terrain heights in metres for the active map, stored once per
+    // load so the readout and line of sight never touch the canvas again.
+    // Rows run north to south like the source image.
+    let terrainGrid = null;
+    let terrainLoadToken = 0;
+    // Identifies the raster/decoding that terrainGrid holds or is loading,
+    // so repeated requests for the same definition do not fetch and decode
+    // the large height image again.
+    let terrainLoadKey = null;
+
+    // Only the fields that affect decoding. Metadata files also carry the
+    // image name and dimensions, which must not trigger a reload.
+    function terrainEncodingSignature(encoding) {
+        return JSON.stringify(["format", "min_m", "step_m", "range_m"].map(field =>
+            field === "format"
+                ? String(encoding?.format || "rg16")
+                : (Number.isFinite(Number(encoding?.[field])) ? Number(encoding[field]) : null)
+        ));
+    }
+
+    function decodeTerrainPixels(rgba, width, height, encoding) {
+        const heights = new Float32Array(width * height);
+        const format = encoding?.format || "rg16";
+        const minimum = Number(encoding?.min_m) || 0;
+        if (format === "r8") {
+            // Legacy 8-bit rasters: min + value / 255 * range.
+            const range = Number(encoding?.range_m) || 0;
+            for (let index = 0; index < heights.length; index += 1) {
+                heights[index] = minimum + rgba[index * 4] / 255 * range;
+            }
+        } else {
+            const step = Number(encoding?.step_m) || 1;
+            for (let index = 0; index < heights.length; index += 1) {
+                const offset = index * 4;
+                heights[index] = minimum + (rgba[offset] * 256 + rgba[offset + 1]) * step;
+            }
+        }
+        return { width, height, heights };
+    }
+
+    async function readTerrainRaster(url, encoding) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+        const blob = await response.blob();
+        // Packed height values must reach the canvas unchanged: no colour
+        // management and no premultiplication.
+        const bitmap = await createImageBitmap(blob, {
+            colorSpaceConversion: "none",
+            premultiplyAlpha: "none"
+        });
+        const canvas = document.createElement("canvas");
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.imageSmoothingEnabled = false;
+        context.drawImage(bitmap, 0, 0);
+        const rgba = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
+        bitmap.close?.();
+        return decodeTerrainPixels(rgba, canvas.width, canvas.height, encoding);
+    }
+
+    function loadTerrainForMap(definition) {
+        const loadKey = definition.terrainImage
+            ? `${definition.terrainImage}|${terrainEncodingSignature(definition.terrainEncoding)}`
+            : null;
+        // Already loaded or in flight for this exact raster and decoding.
+        if (loadKey && loadKey === terrainLoadKey) return;
+        terrainLoadKey = loadKey;
+        terrainReadoutReady = false;
+        terrainGrid = null;
+        const token = ++terrainLoadToken;
+        if (!definition.terrainImage) {
+            if (terrainReadoutElement) {
+                terrainReadoutElement.textContent = "Terrain data is unavailable for this map";
+            }
+            return;
+        }
+        if (terrainReadoutElement) {
+            terrainReadoutElement.textContent = "Terrain: loading compiled height data…";
+        }
+        readTerrainRaster(definition.terrainImage, definition.terrainEncoding)
+            .then(grid => {
+                if (token !== terrainLoadToken) return;
+                terrainGrid = grid;
+                terrainReadoutReady = true;
+                if (terrainReadoutElement) {
+                    terrainReadoutElement.textContent = "Terrain elevation ready · move over the map";
+                }
+                if (planningPoints?.los?.length) {
+                    renderLineOfSight();
+                    updateMapToolsUi();
+                }
+                if (threatCoverEnabled) renderThreatCover();
+            })
+            .catch(error => {
+                if (token !== terrainLoadToken) return;
+                // Allow a later map switch to retry the failed raster.
+                terrainLoadKey = null;
+                console.error("Could not load terrain heights:", error);
+                if (terrainReadoutElement) {
+                    terrainReadoutElement.textContent = "Terrain data could not be loaded for this map";
+                }
+                if (planningPoints?.los?.length) updateMapToolsUi();
+            });
+    }
+
+    // Bilinear terrain height (metres) at a map-image position, or null.
+    function terrainHeightAtMapPoint(mapX, mapY) {
+        const grid = terrainGrid;
+        if (!grid || !Number.isFinite(mapX) || !Number.isFinite(mapY)) return null;
+        if (mapX < 0 || mapX >= IMG_SIZE || mapY < 0 || mapY >= IMG_SIZE) return null;
+        const gx = Math.min(grid.width - 1, Math.max(0, mapX / IMG_SIZE * grid.width - 0.5));
+        const gy = Math.min(grid.height - 1, Math.max(0, (IMG_SIZE - mapY) / IMG_SIZE * grid.height - 0.5));
+        const x0 = Math.floor(gx);
+        const y0 = Math.floor(gy);
+        const x1 = Math.min(grid.width - 1, x0 + 1);
+        const y1 = Math.min(grid.height - 1, y0 + 1);
+        const tx = gx - x0;
+        const ty = gy - y0;
+        const at = (x, y) => grid.heights[y * grid.width + x];
+        const top = at(x0, y0) * (1 - tx) + at(x1, y0) * tx;
+        const bottom = at(x0, y1) * (1 - tx) + at(x1, y1) * tx;
+        return top * (1 - ty) + bottom * ty;
+    }
+
+    // Terrain metadata files written by the extractors override the shipped
+    // decoding parameters, so a re-export needs no page edit.
+    function applyTerrainMeta(definition, meta) {
+        const encoding = meta?.height_encoding;
+        if (encoding?.format && Number.isFinite(Number(encoding.min_m))) {
+            definition.terrainEncoding = encoding;
+        }
+        const minimum = Number(meta?.actual_min_height_m);
+        const maximum = Number(meta?.actual_max_height_m);
+        if (Number.isFinite(minimum) && Number.isFinite(maximum)) {
+            definition.terrainDisplayRange = [minimum, maximum];
+        }
+        if (Number.isFinite(Number(meta?.water_level_m))) {
+            definition.waterLevel = Number(meta.water_level_m);
+        }
+    }
+
+    const terrainReadoutControl = L.control({ position: "bottomleft" });
+    let terrainReadoutElement;
+    terrainReadoutControl.onAdd = () => {
+        terrainReadoutElement = L.DomUtil.create(
+            "div",
+            "terrain-readout"
+        );
+        terrainReadoutElement.textContent =
+            "Terrain: loading compiled height data…";
+        return terrainReadoutElement;
+    };
+    terrainReadoutControl.addTo(map);
+    loadTerrainForMap(activeMapDefinition());
+
+    const terrainLegendControl = L.control({ position: "bottomright" });
+    let terrainLegendElement;
+    terrainLegendControl.onAdd = () => {
+        terrainLegendElement = L.DomUtil.create(
+            "div",
+            "terrain-legend"
+        );
+        terrainLegendElement.innerHTML = `
+            <strong>Extracted terrain elevation</strong>
+            Height data used by terrain shading and LOS
+            <div class="terrain-gradient"></div>
+            <div class="terrain-scale-labels">
+                <span data-terrain-min>low</span><span data-terrain-max>high</span>
+            </div>
+        `;
+        updateTerrainLegendScale(activeMapDefinition());
+        return terrainLegendElement;
+    };
+    terrainLegendControl.addTo(map);
+
+    function updateTerrainLegendScale(definition) {
+        if (!terrainLegendElement) return;
+        const [minimum, maximum] = (definition?.terrainDisplayRange || []).map(Number);
+        const format = value => Number.isFinite(value)
+            ? `${Math.round(value).toLocaleString()} m`
+            : "";
+        const minLabel = terrainLegendElement.querySelector("[data-terrain-min]");
+        const maxLabel = terrainLegendElement.querySelector("[data-terrain-max]");
+        if (minLabel) minLabel.textContent = format(minimum) || "low";
+        if (maxLabel) maxLabel.textContent = format(maximum) || "high";
+    }
+
+    Object.values(MAP_DEFINITIONS).forEach(definition => {
+        if (!definition.terrainMeta) return;
+        fetch(definition.terrainMeta)
+            .then(response => response.ok ? response.json() : null)
+            .then(meta => {
+                if (!meta) return;
+                const previousEncoding = terrainEncodingSignature(definition.terrainEncoding);
+                applyTerrainMeta(definition, meta);
+                if (definition !== activeMapDefinition()) return;
+                updateTerrainLegendScale(definition);
+                if (terrainEncodingSignature(definition.terrainEncoding) !== previousEncoding) {
+                    loadTerrainForMap(definition);
+                }
+            })
+            .catch(() => {
+                // Optional: the shipped decoding parameters remain in use.
+            });
+    });
+
+    function refreshTerrainLegend() {
+        terrainLegendElement?.classList.toggle(
+            "visible",
+            activeMapDefinition().supportsTerrain && map.hasLayer(topographicMapLayer)
+        );
+    }
+
+    map.on("layeradd layerremove", event => {
+        if (event.layer === topographicMapLayer) refreshTerrainLegend();
+    });
+
+    map.on("mousemove", event => {
+        if (!terrainReadoutElement) return;
+        const mapX = event.latlng.lng;
+        const mapY = event.latlng.lat;
+        if (
+            mapX < 0 || mapX >= IMG_SIZE ||
+            mapY < 0 || mapY >= IMG_SIZE
+        ) {
+            terrainReadoutElement.textContent = "Outside terrain grid";
+            return;
+        }
+        const definition = activeMapDefinition();
+        const [minX, minZ] = definition.mapCoord0;
+        const [maxX, maxZ] = definition.mapCoord1;
+        const worldX = minX + mapX / IMG_SIZE * (maxX - minX);
+        const worldZ = minZ + mapY / IMG_SIZE * (maxZ - minZ);
+        if (!definition.supportsTerrain || !definition.terrainImage) {
+            terrainReadoutElement.textContent =
+                `Terrain data is not extracted for this map · X ${worldX.toFixed(0)} m · Z ${worldZ.toFixed(0)} m`;
+            return;
+        }
+        const elevation = terrainReadoutReady ? terrainHeightAtMapPoint(mapX, mapY) : null;
+        if (elevation === null) {
+            terrainReadoutElement.textContent =
+                `X ${worldX.toFixed(0)} m · Z ${worldZ.toFixed(0)} m`;
+            return;
+        }
+        const waterLevel = Number(definition.waterLevel) || 0;
+        const surface = elevation < waterLevel
+            ? `Water · depth ≈ ${Math.round(waterLevel - elevation).toLocaleString()} m`
+            : `Terrain ≈ ${Math.round(elevation).toLocaleString()} m`;
+        terrainReadoutElement.textContent =
+            `${surface} · X ${worldX.toFixed(0)} · Z ${worldZ.toFixed(0)}`;
+    });
+
+    map.createPane("strategicTargets");
+    map.getPane("strategicTargets").style.zIndex = 660;
+    map.createPane("depotMarkers");
+    map.getPane("depotMarkers").style.zIndex = 675;
+
+    const selectedRangeGroup = L.layerGroup().addTo(map);
+    const selectedRangeLayers = new Map();
+    const selectedSamSiteRangeLayers = new Map();
+    let rangeDisclaimerElement = null;
+    let rangeDisclaimerSelectionKey = null;
+
+    function clearSelectedRanges() {
+        selectedRangeGroup.clearLayers();
+        selectedRangeLayers.clear();
+        selectedSamSiteRangeLayers.clear();
+        clearRangeDisclaimer();
+    }
+
+    function clearSamSiteRanges() {
+        selectedSamSiteRangeLayers.forEach(group => selectedRangeGroup.removeLayer(group));
+        selectedSamSiteRangeLayers.clear();
+    }
+
+    function clearRangeDisclaimer() {
+        rangeDisclaimerElement?.classList.remove("is-visible");
+        rangeDisclaimerSelectionKey = null;
+    }
+
+    // Mission AI engagement limits are intentionally different from the
+    // missile's physical flight distance.  The latter is useful in a card,
+    // but it would overstate the area in which the AI actually launches.
+    // `ai_engagement_range` comes from the weapon BLKX aimMaxDist /
+    // attackMaxDist and the mount's AttackMaxRadius (extract_unit_specs.py).
+    function displayEngagementRange(unit, specs) {
+        const missionLimit = Number(unit?.ai_engagement_range || unit?.engagement_range);
+        const extractedAiLimit = Number(specs?.ai_engagement_range);
+        if (missionLimit > 0) return missionLimit;
+        if (extractedAiLimit > 0) return extractedAiLimit;
+        return Number(specs?.engagement_range || 0);
+    }
+
+    // A grouped SAM marker represents the whole battery.  Its range rings
+    // therefore originate at the site's mission origin, not at each launcher
+    // or radar's individual transform.
+    function showSamSiteRanges(entry) {
+        const category = operationalCategory(entry.site);
+        if (!(["shortSams", "longSams"].includes(category))) return;
+        const key = `site:${entry.site.name}`;
+        if (selectedSamSiteRangeLayers.has(key)) return;
+        const values = {
+            detection: 0,
+            tracking: 0,
+            engagement: 0
+        };
+        (entry.units || []).forEach(unit => {
+            const specs = globalUnitSpecs[String(unit.name || "").toLowerCase()];
+            const threatSearch = Number(unit.threat_range);
+            const detection = Number(
+                Number.isFinite(threatSearch) && threatSearch > 0
+                    ? threatSearch
+                    : specs?.sensors?.detection?.nominal ||
+                        Math.max(...(specs?.sensors?.detection?.scope_ranges || []), 0)
+            );
+            const tracking = Number(specs?.sensors?.tracking?.nominal || 0);
+            const engagement = displayEngagementRange(unit, specs);
+            values.detection = Math.max(values.detection, detection || 0);
+            values.tracking = Math.max(values.tracking, tracking || 0);
+            values.engagement = Math.max(values.engagement, engagement || 0);
+        });
+        if (!Object.values(values).some(value => value > 0)) return;
+        const group = L.layerGroup();
+        const color = teamColor(entry.site.team);
+        const position = worldToLatLng(
+            entry.site.world_pos[0],
+            entry.site.world_pos[2]
+        );
+        [
+            [values.detection, { color, weight: 2, opacity: 0.9, fill: false, dashArray: "9, 6" }],
+            [values.tracking, { color, weight: 2, opacity: 0.95, fill: false, dashArray: "2, 5" }],
+            [values.engagement, { color, fillColor: color, fillOpacity: 0.045, weight: 2.25, opacity: 1 }]
+        ].forEach(([value, style]) => {
+            if (!(value > 0)) return;
+            L.circle(position, {
+                radius: worldRadiusToMapRadius(value),
+                interactive: false,
+                ...style
+            }).addTo(group);
+        });
+        if (!group.getLayers().length) return;
+        group.addTo(selectedRangeGroup);
+        selectedSamSiteRangeLayers.set(key, group);
+    }
+
+    const rangeDisclaimerControl = L.control({ position: "bottomleft" });
+    rangeDisclaimerControl.onAdd = () => {
+        const element = L.DomUtil.create("aside", "range-disclaimer-control");
+        element.innerHTML = `
+            <button class="range-disclaimer-close" type="button" aria-label="Close range notice">×</button>
+            <strong>Range guide only</strong>
+            Any radar and missile ranges shown on this map are extracted
+            reference values, not representative of exact in-game performance.
+            Actual detection and engagement depend on terrain, altitude, target
+            aspect, vehicle configuration, and game/AI logic.
+        `;
+        L.DomEvent.disableClickPropagation(element);
+        L.DomEvent.disableScrollPropagation(element);
+        element.querySelector("button").addEventListener("click", event => {
+            L.DomEvent.stop(event);
+            clearRangeDisclaimer();
+        });
+        rangeDisclaimerElement = element;
+        return element;
+    };
+    const planningLayers = {
+        ruler: L.layerGroup().addTo(map),
+        flight: L.layerGroup().addTo(map),
+        los: L.layerGroup().addTo(map),
+        threat: L.layerGroup().addTo(map)
+    };
+    const planningPoints = { ruler: [], los: [] };
+    const flightStrokes = [];
+    let flightCurrentStroke = null;
+    let flightBrushColor = "#90cdf4";
+    let flightBrushSize = 5;
+    let losObserverHeight = 2;
+    let losTargetHeight = 2;
+    let activeMapTool = null;
+    let mapToolsStatus;
+    let rulerToolButton;
+    let flightToolButton;
+    let losToolButton;
+    let flightBrushOptions;
+    let losOptions;
+    let threatToolButton;
+    let threatOptions;
+    let threatStatus;
+    let threatCoverEnabled = false;
+    let threatTeam = uiState.threatTeam === 2 ? 2 : 1;
+    let threatAltitude = Number.isFinite(uiState.threatAltitude) && uiState.threatAltitude >= 0
+        ? Math.min(20000, uiState.threatAltitude)
+        : 100;
+    let threatAltitudeMode = uiState.threatAltitudeMode === "asl" ? "asl" : "agl";
+
+    function mapLatLngToWorld(latlng) {
+        const definition = activeMapDefinition();
+        const [minX, minZ] = definition.mapCoord0;
+        const [maxX, maxZ] = definition.mapCoord1;
+        return [
+            minX + latlng.lng / IMG_SIZE * (maxX - minX),
+            minZ + latlng.lat / IMG_SIZE * (maxZ - minZ)
+        ];
+    }
+
+    function planningDistance(points) {
+        return points.slice(1).reduce((total, point, index) => {
+            const [startX, startZ] = mapLatLngToWorld(points[index]);
+            const [endX, endZ] = mapLatLngToWorld(point);
+            return total + Math.hypot(endX - startX, endZ - startZ);
+        }, 0);
+    }
+
+    function planningMarker(number) {
+        return L.divIcon({
+            className: "",
+            html: `<span class="ruler-waypoint">${number}</span>`,
+            iconSize: [23, 23],
+            iconAnchor: [11.5, 11.5]
+        });
+    }
+
+    function renderRuler() {
+        const points = planningPoints.ruler;
+        const layer = planningLayers.ruler;
+        layer.clearLayers();
+        if (points.length > 1) {
+            L.polyline(points, {
+                color: "#f6e05e",
+                weight: 3,
+                opacity: 0.95,
+                dashArray: "6, 5"
+            }).addTo(layer);
+        }
+        points.forEach((point, index) => {
+            L.marker(point, {
+                icon: planningMarker(index + 1),
+                interactive: false,
+                keyboard: false
+            }).addTo(layer);
+        });
+    }
+
+    function renderFlightBrush() {
+        const strokes = flightCurrentStroke
+            ? [...flightStrokes, flightCurrentStroke]
+            : flightStrokes;
+        planningLayers.flight.clearLayers();
+        strokes.forEach(stroke => {
+            if (stroke.points.length < 2) return;
+            L.polyline(stroke.points, {
+                color: stroke.color,
+                weight: stroke.size,
+                opacity: 0.9,
+                lineCap: "round",
+                lineJoin: "round",
+                smoothFactor: 1.2,
+                interactive: false
+            }).addTo(planningLayers.flight);
+        });
+    }
+
+    // Height of the visible surface: terrain, or the water plane above the
+    // seabed. Line of sight and observer/target heights use this surface.
+    function sampleTerrainElevation(latlng) {
+        const definition = activeMapDefinition();
+        if (!definition.supportsTerrain || !terrainReadoutReady) return null;
+        const terrain = terrainHeightAtMapPoint(Number(latlng.lng), Number(latlng.lat));
+        if (terrain === null) return null;
+        return Math.max(terrain, Number(definition.waterLevel) || 0);
+    }
+
+    function renderLineOfSight() {
+        const layer = planningLayers.los;
+        layer.clearLayers();
+        renderLineOfSight.lastResult = null;
+        const points = planningPoints.los;
+        if (!points.length) return;
+        const observer = points[0];
+        const observerGround = sampleTerrainElevation(observer);
+        L.circleMarker(observer, {
+            radius: 7,
+            color: "#90cdf4",
+            weight: 2,
+            fillColor: "#2b6cb0",
+            fillOpacity: 0.95,
+            interactive: false
+        }).addTo(layer);
+        if (observerGround === null) return;
+
+        const observerX = Number(observer.lng);
+        const observerY = Number(observer.lat);
+        const pixelsPerCell = IMG_SIZE / LOS_GRID_SIZE;
+        const definition = activeMapDefinition();
+        const metersPerPixel = (
+            definition.mapCoord1[0] - definition.mapCoord0[0]
+        ) / IMG_SIZE;
+        const observerHeight = observerGround + losObserverHeight;
+        const state = new Uint8Array(LOS_GRID_SIZE * LOS_GRID_SIZE);
+        const rayCount = LOS_GRID_SIZE * 4;
+        const imageCanvas = document.createElement("canvas");
+        imageCanvas.width = LOS_GRID_SIZE;
+        imageCanvas.height = LOS_GRID_SIZE;
+        const imageContext = imageCanvas.getContext("2d");
+        const imageData = imageContext.createImageData(LOS_GRID_SIZE, LOS_GRID_SIZE);
+
+        // Cast radial rays from the observer. The highest terrain angle seen
+        // so far on each ray becomes the horizon; everything behind it is in
+        // the red shadow. A 256px grid keeps this interactive on both maps.
+        for (let ray = 0; ray < rayCount; ray += 1) {
+            const angle = ray / rayCount * Math.PI * 2;
+            const directionX = Math.cos(angle);
+            const directionY = Math.sin(angle);
+            const edgeDistances = [];
+            if (directionX > 0) edgeDistances.push((IMG_SIZE - observerX) / directionX);
+            if (directionX < 0) edgeDistances.push(-observerX / directionX);
+            if (directionY > 0) edgeDistances.push((IMG_SIZE - observerY) / directionY);
+            if (directionY < 0) edgeDistances.push(-observerY / directionY);
+            const maxDistance = Math.min(...edgeDistances.filter(Number.isFinite));
+            const steps = Math.max(1, Math.ceil(maxDistance / pixelsPerCell));
+            let horizonAngle = -Infinity;
+            for (let step = 1; step <= steps; step += 1) {
+                const distancePixels = Math.min(maxDistance, step * pixelsPerCell);
+                const x = observerX + directionX * distancePixels;
+                const y = observerY + directionY * distancePixels;
+                if (x < 0 || x >= IMG_SIZE || y < 0 || y >= IMG_SIZE) continue;
+                const terrain = sampleTerrainElevation(L.latLng(y, x));
+                if (terrain === null) continue;
+                const distanceMeters = distancePixels * metersPerPixel;
+                // The horizon is formed by the ground; the target stands
+                // above it. Mixing the two would let a raised target hide
+                // everything behind it, shrinking the area as height grows.
+                const terrainAngle = Math.atan2(terrain - observerHeight, distanceMeters);
+                const targetAngle = Math.atan2(
+                    terrain + losTargetHeight - observerHeight,
+                    distanceMeters
+                );
+                const gridX = Math.min(LOS_GRID_SIZE - 1, Math.floor(x / pixelsPerCell));
+                const gridY = Math.min(LOS_GRID_SIZE - 1, Math.floor(y / pixelsPerCell));
+                // Leaflet's CRS.Simple image rows run from north to south,
+                // while map latitude and the terrain sampler run south to
+                // north. Flip the raster row so the overlay stays anchored
+                // to the clicked observer position.
+                const imageRow = LOS_GRID_SIZE - 1 - gridY;
+                const cellIndex = imageRow * LOS_GRID_SIZE + gridX;
+                // Rays overlap near the observer; any ray that sees the
+                // cell makes it visible, so the result is not order-dependent.
+                if (targetAngle >= horizonAngle - 0.0001) {
+                    state[cellIndex] = 1;
+                } else if (state[cellIndex] !== 1) {
+                    state[cellIndex] = 2;
+                }
+                horizonAngle = Math.max(horizonAngle, terrainAngle);
+            }
+        }
+
+        let visibleCells = 0;
+        let blockedCells = 0;
+        for (let index = 0; index < state.length; index += 1) {
+            const offset = index * 4;
+            if (state[index] === 1) {
+                visibleCells += 1;
+                imageData.data[offset] = 104;
+                imageData.data[offset + 1] = 211;
+                imageData.data[offset + 2] = 145;
+                imageData.data[offset + 3] = 72;
+            } else if (state[index] === 2) {
+                blockedCells += 1;
+                imageData.data[offset] = 252;
+                imageData.data[offset + 1] = 129;
+                imageData.data[offset + 2] = 129;
+                imageData.data[offset + 3] = 92;
+            }
+        }
+        imageContext.putImageData(imageData, 0, 0);
+        L.imageOverlay(imageCanvas.toDataURL("image/png"), bounds, {
+            opacity: 1,
+            interactive: false,
+            className: "los-viewshed-overlay"
+        }).addTo(layer);
+        renderLineOfSight.lastResult = {
+            visibleCells,
+            blockedCells,
+            coverage: visibleCells + blockedCells
+        };
+    }
+
+    // Radar and air-defence coverage for an aircraft at a chosen altitude.
+    // Each emitter of the selected team is swept like the LOS tool: the
+    // ground along a ray forms the horizon, and a cell is covered when an
+    // aircraft above it is within range and above that horizon. Ranges are
+    // the same extracted values as the range rings; altitude limits, radar
+    // clutter and Earth curvature are not modelled.
+    const THREAT_ANTENNA_HEIGHT = { ground: 10, ship: 20 };
+    const THREAT_AA_ROLES = new Set(["spaa", "launcher"]);
+
+    function threatGridSize(definition) {
+        const width = definition.mapCoord1[0] - definition.mapCoord0[0];
+        return Math.min(512, Math.max(128, Math.round(width / THREAT_CELL_METERS)));
+    }
+
+    function threatEmitters(team, era) {
+        const merged = new Map();
+        const cellPixels = IMG_SIZE / threatGridSize(activeMapDefinition());
+        globalSiteData.forEach(site => {
+            if (site.team !== team) return;
+            const ship = site.source_group === "ships";
+            (site.units_by_era?.[era] || []).forEach(unit => {
+                const specs = globalUnitSpecs[String(unit.name || "").toLowerCase()];
+                // Mission templates switch some air-defence radars off.
+                const radarOff = /radar_off/.test(String(unit.template || ""));
+                const threatSearch = Number(unit.threat_range);
+                const detection = radarOff ? 0 : Number(
+                    threatSearch > 0
+                        ? threatSearch
+                        : specs?.sensors?.detection?.nominal ||
+                            Math.max(...(specs?.sensors?.detection?.scope_ranges || []), 0)
+                ) || 0;
+                const tracking = radarOff ? 0 : Number(specs?.sensors?.tracking?.nominal || 0);
+                const role = String(unit.role || "").toLowerCase();
+                const engagement = ship || THREAT_AA_ROLES.has(role)
+                    ? displayEngagementRange(unit, specs) || 0
+                    : 0;
+                const radar = Math.max(detection, tracking);
+                if (!(radar > 0) && !(engagement > 0)) return;
+                const position = unit.world_pos || site.world_pos;
+                if (!position) return;
+                const [lat, lng] = worldToLatLng(position[0], position[2]);
+                const x = lng / cellPixels;
+                const y = lat / cellPixels;
+                // Launchers and radars of one battery share cells; sweep
+                // each cell once with the battery's longest ranges.
+                const key = `${Math.floor(x)},${Math.floor(y)},${ship ? "s" : "g"}`;
+                const entry = merged.get(key) || {
+                    x, y, ship, radar: 0, engagement: 0
+                };
+                entry.radar = Math.max(entry.radar, radar);
+                entry.engagement = Math.max(entry.engagement, engagement);
+                merged.set(key, entry);
+            });
+        });
+        return [...merged.values()];
+    }
+
+    function renderThreatCover() {
+        const layer = planningLayers.threat;
+        layer.clearLayers();
+        renderThreatCover.lastResult = null;
+        if (!threatCoverEnabled) {
+            updateThreatStatus();
+            return;
+        }
+        const definition = activeMapDefinition();
+        if (!definition.supportsTerrain || !terrainReadoutReady || !globalSiteData.length) {
+            updateThreatStatus();
+            return;
+        }
+        const size = threatGridSize(definition);
+        const cellPixels = IMG_SIZE / size;
+        const cellMeters = (
+            definition.mapCoord1[0] - definition.mapCoord0[0]
+        ) / size;
+        const waterLevel = Number(definition.waterLevel) || 0;
+        // Ground (or water surface) at each cell centre; grid rows run south
+        // to north like map latitude.
+        const ground = new Float32Array(size * size);
+        for (let row = 0; row < size; row += 1) {
+            for (let column = 0; column < size; column += 1) {
+                const height = terrainHeightAtMapPoint(
+                    (column + 0.5) * cellPixels,
+                    (row + 0.5) * cellPixels
+                );
+                ground[row * size + column] = Math.max(height ?? waterLevel, waterLevel);
+            }
+        }
+        const aboveGround = threatAltitudeMode === "agl";
+        const targetHeightAt = index => aboveGround
+            ? ground[index] + threatAltitude
+            : threatAltitude;
+        // 0 none, 1 radar coverage, 2 weapon coverage, 3 below the ground.
+        const cover = new Uint8Array(size * size);
+        if (!aboveGround) {
+            for (let index = 0; index < cover.length; index += 1) {
+                if (threatAltitude < ground[index]) cover[index] = 3;
+            }
+        }
+        const emitters = threatEmitters(threatTeam, selectedPresetId());
+        emitters.forEach(emitter => {
+            const range = Math.max(emitter.radar, emitter.engagement);
+            const originColumn = Math.min(size - 1, Math.max(0, Math.floor(emitter.x)));
+            const originRow = Math.min(size - 1, Math.max(0, Math.floor(emitter.y)));
+            const antenna = ground[originRow * size + originColumn] +
+                THREAT_ANTENNA_HEIGHT[emitter.ship ? "ship" : "ground"];
+            const mark = (index, distance) => {
+                if (cover[index] >= 2) return;
+                const rise = targetHeightAt(index) - antenna;
+                const slant = distance * distance + rise * rise;
+                if (emitter.engagement > 0 && slant <= emitter.engagement ** 2) {
+                    cover[index] = 2;
+                } else if (emitter.radar > 0 && slant <= emitter.radar ** 2 && cover[index] !== 3) {
+                    cover[index] = 1;
+                }
+            };
+            mark(originRow * size + originColumn, 0);
+            // Long-range radars reach far past the map edge; only the part
+            // up to the farthest grid corner needs rays.
+            const reachCells = Math.min(
+                range / cellMeters,
+                Math.max(
+                    Math.hypot(emitter.x, emitter.y),
+                    Math.hypot(size - emitter.x, emitter.y),
+                    Math.hypot(emitter.x, size - emitter.y),
+                    Math.hypot(size - emitter.x, size - emitter.y)
+                )
+            );
+            // Enough rays that neighbouring rays are under a cell apart at
+            // the edge of the reach.
+            const rayCount = Math.max(64, Math.ceil(Math.PI * 2 * reachCells * 1.5));
+            const steps = Math.ceil(reachCells);
+            for (let ray = 0; ray < rayCount; ray += 1) {
+                const angle = ray / rayCount * Math.PI * 2;
+                const directionX = Math.cos(angle);
+                const directionY = Math.sin(angle);
+                let horizon = -Infinity;
+                for (let step = 1; step <= steps; step += 1) {
+                    const column = Math.floor(emitter.x + directionX * step);
+                    const row = Math.floor(emitter.y + directionY * step);
+                    if (column < 0 || column >= size || row < 0 || row >= size) break;
+                    const index = row * size + column;
+                    const distance = step * cellMeters;
+                    const surface = ground[index];
+                    const target = targetHeightAt(index);
+                    if (target >= surface &&
+                        (target - antenna) / distance >= horizon - 1e-6) {
+                        mark(index, distance);
+                    }
+                    horizon = Math.max(horizon, (surface - antenna) / distance);
+                }
+            }
+        });
+
+        const canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        const context = canvas.getContext("2d");
+        const image = context.createImageData(size, size);
+        const colours = {
+            1: [246, 224, 94, 88],
+            2: [245, 101, 101, 120],
+            3: [26, 32, 44, 150]
+        };
+        let radarCells = 0;
+        let weaponCells = 0;
+        for (let row = 0; row < size; row += 1) {
+            for (let column = 0; column < size; column += 1) {
+                const value = cover[row * size + column];
+                if (!value) continue;
+                if (value === 1) radarCells += 1;
+                if (value === 2) weaponCells += 1;
+                // Image rows run north to south; grid rows south to north.
+                const offset = ((size - 1 - row) * size + column) * 4;
+                image.data.set(colours[value], offset);
+            }
+        }
+        context.putImageData(image, 0, 0);
+        L.imageOverlay(canvas.toDataURL("image/png"), bounds, {
+            opacity: 1,
+            interactive: false,
+            className: "threat-cover-overlay"
+        }).addTo(layer);
+        renderThreatCover.lastResult = {
+            emitters: emitters.length,
+            radarPercent: Math.round((radarCells + weaponCells) / cover.length * 100),
+            weaponPercent: Math.round(weaponCells / cover.length * 100)
+        };
+        updateThreatStatus();
+    }
+
+    function updateThreatStatus() {
+        threatToolButton?.setAttribute("aria-pressed", String(threatCoverEnabled));
+        if (threatOptions) threatOptions.hidden = !threatCoverEnabled;
+        if (!threatStatus) return;
+        const result = renderThreatCover.lastResult;
+        if (!activeMapDefinition().supportsTerrain) {
+            threatStatus.textContent = "Terrain elevation is unavailable for this map.";
+        } else if (!terrainReadoutReady || !globalSiteData.length) {
+            threatStatus.textContent = "Loading terrain and site data…";
+        } else if (result) {
+            threatStatus.textContent = result.emitters
+                ? `${result.emitters} emitter positions · ${result.radarPercent}% of map in coverage · ${result.weaponPercent}% in weapon range.`
+                : "No radar or air defence for this team in this scenario.";
+        } else {
+            threatStatus.textContent = "";
+        }
+    }
+
+    let threatRenderTimer = null;
+    function scheduleThreatCover() {
+        clearTimeout(threatRenderTimer);
+        threatRenderTimer = setTimeout(renderThreatCover, 150);
+    }
+
+    function updateMapToolsUi() {
+        rulerToolButton?.setAttribute(
+            "aria-pressed", String(activeMapTool === "ruler")
+        );
+        flightToolButton?.setAttribute(
+            "aria-pressed", String(activeMapTool === "flight")
+        );
+        losToolButton?.setAttribute(
+            "aria-pressed", String(activeMapTool === "los")
+        );
+        if (!mapToolsStatus) return;
+        if (activeMapTool === "ruler") {
+            const points = planningPoints.ruler;
+            mapToolsStatus.textContent = points.length
+                ? `Ruler: ${points.length} points · ${formatDistance(planningDistance(points))}. Click map to add.`
+                : "Ruler active — click the map to add points.";
+        } else if (activeMapTool === "flight") {
+            mapToolsStatus.textContent = flightStrokes.length
+                ? `Flight brush: ${flightStrokes.length} stroke${flightStrokes.length === 1 ? "" : "s"}. Drag on the map to add.`
+                : "Flight brush active — drag on the map to draw a route.";
+        } else if (activeMapTool === "los") {
+            const points = planningPoints.los;
+            const result = renderLineOfSight.lastResult;
+            if (!activeMapDefinition().supportsTerrain) {
+                mapToolsStatus.textContent = points.length
+                    ? "Terrain elevation is unavailable for this map."
+                    : "LOS active — click an observer point on the map.";
+            } else if (!terrainReadoutReady) {
+                mapToolsStatus.textContent = "Loading terrain elevation…";
+            } else if (result && points.length) {
+                const total = result.coverage || 1;
+                const visiblePercent = Math.round(result.visibleCells / total * 100);
+                mapToolsStatus.textContent =
+                    `Viewshed ready · ${visiblePercent}% visible · red is terrain shadow.`;
+            } else {
+                mapToolsStatus.textContent = points.length
+                    ? "Viewshed ready — click a new point to move the observer."
+                    : "LOS active — click an observer point on the map.";
+            }
+        } else {
+            mapToolsStatus.textContent = "Choose a tool, then click on the map.";
+        }
+        if (flightBrushOptions) {
+            flightBrushOptions.hidden = activeMapTool !== "flight";
+        }
+        if (losOptions) {
+            losOptions.hidden = activeMapTool !== "los";
+        }
+    }
+
+    function setActiveMapTool(tool) {
+        activeMapTool = activeMapTool === tool ? null : tool;
+        if (activeMapTool) {
+            map.doubleClickZoom.disable();
+        } else {
+            map.doubleClickZoom.enable();
+        }
+        map.getContainer().style.cursor = ["flight", "los"].includes(activeMapTool) ? "crosshair" : "";
+        // A drag draws while the flight brush is active (mouse, pen or
+        // touch), so the map must not pan at the same time.
+        finishFlightStroke();
+        if (activeMapTool === "flight") {
+            map.dragging.disable();
+        } else {
+            map.dragging.enable();
+        }
+        map.getContainer().classList.toggle("flight-brush-active", activeMapTool === "flight");
+        updateMapToolsUi();
+    }
+
+    function clearPlanningTools() {
+        planningPoints.ruler = [];
+        planningPoints.los = [];
+        flightStrokes.length = 0;
+        flightCurrentStroke = null;
+        planningLayers.ruler.clearLayers();
+        planningLayers.flight.clearLayers();
+        planningLayers.los.clearLayers();
+        renderLineOfSight.lastResult = null;
+        updateMapToolsUi();
+    }
+
+    function addPlanningPoint(latlng) {
+        if (activeMapTool !== "ruler") return false;
+        planningPoints.ruler.push(latlng);
+        renderRuler();
+        updateMapToolsUi();
+        return true;
+    }
+
+    function addLineOfSightPoint(latlng) {
+        if (activeMapTool !== "los") return false;
+        planningPoints.los = [latlng];
+        renderLineOfSight();
+        updateMapToolsUi();
+        return true;
+    }
+
+    function finishFlightStroke() {
+        if (!flightCurrentStroke) return;
+        if (flightCurrentStroke.points.length > 1) {
+            flightStrokes.push(flightCurrentStroke);
+        }
+        flightCurrentStroke = null;
+        renderFlightBrush();
+        updateMapToolsUi();
+    }
+
+    const mapToolsControl = L.control({ position: "bottomleft" });
+    mapToolsControl.onAdd = () => {
+        const element = L.DomUtil.create("section", "map-tools-control");
+        element.innerHTML = `
+            <strong>Map tools</strong>
+            <div class="map-tools-actions">
+                <button type="button" data-tool="ruler" aria-pressed="false">Measure</button>
+                <button type="button" data-tool="los" aria-pressed="false" title="Create a terrain viewshed from one observer point">Line of sight</button>
+                <button type="button" data-tool="flight" aria-pressed="false">Flight brush</button>
+                <button type="button" data-tool="threat" aria-pressed="false" title="Show where one team's radars and air defences cover an aircraft at a chosen altitude">Threat cover</button>
+                <button type="button" data-tool="clear">Clear</button>
+            </div>
+            <div class="brush-options" hidden>
+                <label><span>Colour</span><select data-tool="flight-colour" aria-label="Flight brush colour">
+                    <option value="#90cdf4">Blue</option>
+                    <option value="#f6e05e">Yellow</option>
+                    <option value="#fc8181">Red</option>
+                    <option value="#68d391">Green</option>
+                    <option value="#e2e8f0">White</option>
+                </select></label>
+                <label><span>Size</span><input data-tool="flight-size" type="range" min="2" max="18" step="1" value="5" aria-label="Flight brush size"></label>
+            </div>
+            <div class="los-options" hidden>
+                <label><span>Observer height</span><input data-tool="los-observer-height" type="number" min="0" max="1000" step="1" value="2" aria-label="Observer height above ground in metres"></label>
+                <label><span>Target height</span><input data-tool="los-target-height" type="number" min="0" max="1000" step="1" value="2" aria-label="Target height above ground in metres"></label>
+                <small class="los-hint">Green: a target at this height above the surface is in view of the observer. Red: hidden behind terrain.</small>
+            </div>
+            <div class="threat-options" hidden>
+                <label><span>Threats from</span><select data-tool="threat-team" aria-label="Team whose radars and air defences are shown">
+                    <option value="1">REDFOR</option>
+                    <option value="2">BLUFOR</option>
+                </select></label>
+                <label><span>Altitude (m)</span><input data-tool="threat-altitude" type="number" min="0" max="20000" step="50" aria-label="Aircraft altitude in metres"></label>
+                <label><span>Measured</span><select data-tool="threat-altitude-mode" aria-label="Altitude reference">
+                    <option value="agl">Above ground</option>
+                    <option value="asl">Above sea level</option>
+                </select></label>
+                <div class="threat-legend">
+                    <span><i style="background: rgba(245, 101, 101, 0.8)"></i>Weapon range</span>
+                    <span><i style="background: rgba(246, 224, 94, 0.7)"></i>Radar coverage</span>
+                    <span><i style="background: rgba(26, 32, 44, 0.9)"></i>Below terrain</span>
+                </div>
+                <small class="los-hint">Range and terrain masking only: SAM altitude limits, radar ground clutter and Earth curvature are not modelled. Ships are shown at their spawn points.</small>
+                <div class="threat-status" aria-live="polite"></div>
+            </div>
+            <div class="map-tools-status" aria-live="polite"></div>
+        `;
+        L.DomEvent.disableClickPropagation(element);
+        L.DomEvent.disableScrollPropagation(element);
+        rulerToolButton = element.querySelector('[data-tool="ruler"]');
+        flightToolButton = element.querySelector('[data-tool="flight"]');
+        losToolButton = element.querySelector('[data-tool="los"]');
+        rulerToolButton.addEventListener("click", () => setActiveMapTool("ruler"));
+        flightToolButton.addEventListener("click", () => setActiveMapTool("flight"));
+        losToolButton.addEventListener("click", () => setActiveMapTool("los"));
+        // Threat cover is an overlay, not a click tool, so it stays on while
+        // the ruler, LOS or flight brush is used.
+        threatToolButton = element.querySelector('[data-tool="threat"]');
+        threatOptions = element.querySelector(".threat-options");
+        threatStatus = element.querySelector(".threat-status");
+        threatToolButton.addEventListener("click", () => {
+            threatCoverEnabled = !threatCoverEnabled;
+            renderThreatCover();
+        });
+        const threatTeamInput = element.querySelector('[data-tool="threat-team"]');
+        const threatAltitudeInput = element.querySelector('[data-tool="threat-altitude"]');
+        const threatModeInput = element.querySelector('[data-tool="threat-altitude-mode"]');
+        threatTeamInput.value = String(threatTeam);
+        threatAltitudeInput.value = String(threatAltitude);
+        threatModeInput.value = threatAltitudeMode;
+        threatTeamInput.addEventListener("change", event => {
+            threatTeam = Number(event.target.value) === 2 ? 2 : 1;
+            saveUiState({ threatTeam });
+            renderThreatCover();
+        });
+        threatAltitudeInput.addEventListener("input", event => {
+            const value = Number(event.target.value);
+            if (!Number.isFinite(value) || value < 0) return;
+            threatAltitude = Math.min(20000, value);
+            saveUiState({ threatAltitude });
+            scheduleThreatCover();
+        });
+        threatModeInput.addEventListener("change", event => {
+            threatAltitudeMode = event.target.value === "asl" ? "asl" : "agl";
+            saveUiState({ threatAltitudeMode });
+            renderThreatCover();
+        });
+        element.querySelector('[data-tool="clear"]').addEventListener("click", clearPlanningTools);
+        flightBrushOptions = element.querySelector(".brush-options");
+        losOptions = element.querySelector(".los-options");
+        element.querySelector('[data-tool="flight-colour"]').addEventListener("change", event => {
+            flightBrushColor = event.target.value;
+        });
+        element.querySelector('[data-tool="flight-size"]').addEventListener("input", event => {
+            flightBrushSize = Number(event.target.value);
+        });
+        element.querySelector('[data-tool="los-observer-height"]').addEventListener("input", event => {
+            losObserverHeight = Math.max(0, Number(event.target.value) || 0);
+            if (planningPoints.los.length) renderLineOfSight();
+            updateMapToolsUi();
+        });
+        element.querySelector('[data-tool="los-target-height"]').addEventListener("input", event => {
+            losTargetHeight = Math.max(0, Number(event.target.value) || 0);
+            if (planningPoints.los.length) renderLineOfSight();
+            updateMapToolsUi();
+        });
+        mapToolsStatus = element.querySelector(".map-tools-status");
+        updateMapToolsUi();
+        return element;
+    };
+    mapToolsControl.addTo(map);
+    rangeDisclaimerControl.addTo(map);
+
+    map.on("click", event => {
+        if (activeMapTool === "flight") return;
+        if (addPlanningPoint(event.latlng)) return;
+        if (addLineOfSightPoint(event.latlng)) return;
+        clearSelectedRanges();
+        clearRouteSelection();
+        // At detail zoom, keep the individual unit layer in place when the
+        // user clicks empty map space. The grouped-site context is cleared,
+        // but removing the temporary focused layer here makes units vanish
+        // until the next redraw.
+        clearFocusedSite({ keepDetails: map.getZoom() >= DETAIL_ZOOM });
+        // Re-apply the zoom representation after clearing a grouped-site
+        // selection. At detail zoom the normal unit groups must remain on the
+        // map; otherwise units that were temporarily shown through the
+        // focused group can appear to vanish after an empty-map click.
+        syncDetailVisibility();
+        if (legendCategory) {
+            legendCategory = null;
+            renderSiteLegend();
+            applyLegendHighlights();
+        }
+    });
+
+    map.on("dblclick", event => {
+        if (activeMapTool !== "ruler") return;
+        event.originalEvent?.preventDefault();
+        // A double-click first delivers two ordinary clicks at the same
+        // spot. Keep one point there instead of three stacked waypoints.
+        const points = planningPoints.ruler;
+        const samePlace = point =>
+            Math.hypot(point.lat - event.latlng.lat, point.lng - event.latlng.lng) < 1;
+        while (
+            points.length > 1 &&
+            samePlace(points[points.length - 1]) &&
+            samePlace(points[points.length - 2])
+        ) {
+            points.pop();
+        }
+        renderRuler();
+        setActiveMapTool("ruler");
+    });
+
+    // Pointer events cover mouse, pen and touch; Leaflet's mouse events
+    // never fire for a touch drag. Map dragging is disabled while the tool
+    // is active (setActiveMapTool), so the drag only draws.
+    const flightBrushSurface = map.getContainer();
+    flightBrushSurface.addEventListener("pointerdown", event => {
+        if (activeMapTool !== "flight") return;
+        if (event.target.closest(".leaflet-control-container, .leaflet-popup")) return;
+        if (!event.isPrimary) {
+            // A second finger means a pinch: drop the partial stroke.
+            flightCurrentStroke = null;
+            renderFlightBrush();
+            return;
+        }
+        if (event.button !== 0) return;
+        flightCurrentStroke = {
+            points: [map.mouseEventToLatLng(event)],
+            color: flightBrushColor,
+            size: flightBrushSize
+        };
+        // Keep receiving moves when the pointer leaves the map.
+        flightBrushSurface.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+    });
+
+    flightBrushSurface.addEventListener("pointermove", event => {
+        if (!flightCurrentStroke || !event.isPrimary) return;
+        const latlng = map.mouseEventToLatLng(event);
+        const points = flightCurrentStroke.points;
+        const previous = points[points.length - 1];
+        if (Math.hypot(previous.lat - latlng.lat, previous.lng - latlng.lng) < 0.5) return;
+        points.push(latlng);
+        renderFlightBrush();
+    });
+
+    ["pointerup", "pointercancel"].forEach(type =>
+        flightBrushSurface.addEventListener(type, event => {
+            if (event.isPrimary) finishFlightStroke();
+        })
+    );
+
+    function makeVisibleLayerGroup() {
+        return L.layerGroup().addTo(map);
+    }
+
+    const operationalKeys = [
+        "strongpoints",
+        "vehicleDepots",
+        "fuelAmmoDepots",
+        "shortSams",
+        "longSams",
+        "ewRadars",
+        "airfields",
+        "strategic",
+        "fleet"
+    ];
+
+    function makeOperationalUnitGroups() {
+        return Object.fromEntries(
+            operationalKeys.map(key => [key, makeVisibleLayerGroup()])
+        );
+    }
+
+    const unitGroups = {
+        1: makeOperationalUnitGroups(),
+        2: makeOperationalUnitGroups()
+    };
+
+    const siteGroups = {
+        1: makeOperationalUnitGroups(),
+        2: makeOperationalUnitGroups()
+    };
+    const focusedDetailGroup = L.layerGroup().addTo(map);
+    const detailLayersBySite = new Map();
+    const overviewMarkers = [];
+    const runwayLayersBySite = new Map();
+    const runwayOutlineLayersBySite = new Map();
+    const DETAIL_ZOOM = 1.5;
+    let focusedOverviewSite = null;
+    let focusedOverviewMarker = null;
+    // A runway click highlights that airfield without selecting it. Keep it
+    // separate from focusedOverviewSite, which must always belong to
+    // focusedOverviewMarker so the marker returns to its own layer group.
+    let highlightedRunwaySite = null;
+    const focusedOverviewSelections = new Map();
+    // Grouped sites use a deliberate two-step interaction: first select the
+    // site in place, then click the same marker again to expand and zoom.
+    let focusedOverviewExpanded = false;
+    let latestOverviewEntries = [];
+    let legendTeam = 1;
+    let legendCategory = null;
+
+    const asphaltRoadGroup = L.layerGroup();
+    const gravelRoadGroup = L.layerGroup();
+
+    function makeMissionGroups() {
+        return {
+            strongpoints: {
+                objectives: L.layerGroup(),
+                capture: L.layerGroup()
+            },
+            vehicleDepots: {
+                objectives: L.layerGroup(),
+                capture: L.layerGroup(),
+                armored: L.layerGroup()
+            },
+            fuelAmmoDepots: {
+                objectives: L.layerGroup(),
+                capture: L.layerGroup(),
+                convoy: L.layerGroup()
+            },
+            airfields: {
+                runways: L.layerGroup().addTo(map),
+                capture: L.layerGroup()
+            },
+            strategic: {
+                mlrsSpawn: L.layerGroup(),
+                tbmSpawn: L.layerGroup(),
+                mlrsMove: L.layerGroup(),
+                tbmMove: L.layerGroup(),
+                targets: L.layerGroup(),
+                bombers: L.layerGroup()
+            },
+            fleet: {
+                routes: L.layerGroup().addTo(map)
+            }
+        };
+    }
+
+    const missionGroups = {
+        1: makeMissionGroups(),
+        2: makeMissionGroups()
+    };
+
+    function makeCoverageCategory() {
+        return {
+            detection: L.layerGroup(),
+            tracking: L.layerGroup(),
+            engagement: L.layerGroup()
+        };
+    }
+
+    function makeTeamCoverage() {
+        return Object.fromEntries(
+            operationalKeys.map(key => [key, makeCoverageCategory()])
+        );
+    }
+
+    const coverageGroups = {
+        1: makeTeamCoverage(),
+        2: makeTeamCoverage()
+    };
+
+    const renderedGroups = [
+        ...Object.values(unitGroups).flatMap(groups => Object.values(groups)),
+        ...Object.values(siteGroups).flatMap(groups => Object.values(groups)),
+        ...Object.values(missionGroups).flatMap(groups => [
+            groups.airfields.runways,
+            groups.fleet.routes
+        ]),
+        ...Object.values(coverageGroups).flatMap(categories =>
+            Object.values(categories).flatMap(groups => Object.values(groups))
+        )
+    ];
+
+    let globalSiteData = [];
+    let globalMapVariants = {};
+    let globalMissionLogicVariants = {};
+    let globalPresetData = { presets: [], variants: [] };
+    let globalUnitSpecs = {};
+    let globalUnitDisplayNames = {};
+    let globalIconTemplates = { nato: {}, vanilla: {}, pact: {}, aircraft: {} };
+    let globalMissionLogic = null;
+    let globalConvoyRoutes = new Map();
+    let globalArmoredRoutes = new Map();
+    let globalRoadGraph = null;
+    let globalNavmeshGraph = null;
+    let globalRoadData = [];
+    let globalRoadDataByMap = {};
+    let globalNavmeshDataByMap = {};
+    let globalSiteLocations = new Map();
+    const routeVisuals = new Map();
+    const selectedDepotGroup = L.layerGroup().addTo(map);
+    const autoRouteGroups = new Set();
+    let selectedRouteKeys = new Set();
+    let routeVisibilityKeys = null;
+    let selectedDepotName = null;
+    // activateMapVariant falls back to the map's default for an unknown id.
+    let currentMapVariant = typeof uiState.mapVariant === "string"
+        ? uiState.mapVariant
+        : "standard";
+
+    function locationsByName(records) {
+        return new Map(records.map(record => [record.name, record]));
+    }
+
+    function populateMapSelector() {
+        const options = document.getElementById("map-options");
+        options.replaceChildren();
+        Object.values(MAP_DEFINITIONS).forEach(definition => {
+            const label = document.createElement("label");
+            const input = document.createElement("input");
+            input.type = "radio";
+            input.name = "map";
+            input.value = definition.id;
+            input.checked = definition.id === currentMapId;
+            input.addEventListener("change", event => {
+                currentMapId = event.target.value;
+                saveUiState({ map: currentMapId });
+                // Planning points are stored in image coordinates, which
+                // mean different world positions and scales on each map.
+                clearPlanningTools();
+                refreshMapArtwork();
+                rebuildGroupedLayerControl();
+                activateMapVariant(activeMapDefinition().defaultVariant);
+            });
+            label.append(input, definition.label);
+            options.append(label);
+        });
+    }
+
+    // Setting an unchanged URL still makes the browser request the image
+    // again, which doubled the large map download on startup.
+    function setOverlayUrl(layer, url) {
+        if (layer._url !== url) layer.setUrl(url);
+    }
+
+    function refreshMapArtwork() {
+        const definition = activeMapDefinition();
+        updateTerrainLegendScale(definition);
+        setOverlayUrl(standardMapLayer, definition.image);
+        setOverlayUrl(topographicMapLayer, definition.terrainOverlay || definition.image);
+        loadTerrainForMap(definition);
+        if (!definition.supportsTerrain && map.hasLayer(topographicMapLayer)) {
+            map.removeLayer(topographicMapLayer);
+        }
+        if (!definition.supportsRoads) {
+            asphaltRoadGroup.clearLayers();
+            gravelRoadGroup.clearLayers();
+        }
+        if (!definition.supportsTerrain && terrainReadoutElement) {
+            terrainReadoutElement.textContent =
+                "Terrain data is unavailable for this map";
+        }
+        refreshTerrainLegend();
+        map.fitBounds(bounds, { animate: false });
+    }
+
+    function updateTeamSwapUi() {
+        const swapButton = document.getElementById("team-swap");
+        const definition = activeMapDefinition();
+        if (!definition.supportsTeamSwap) {
+            swapButton.disabled = true;
+            swapButton.setAttribute("aria-pressed", "false");
+            swapButton.textContent = "SWAP SIDES (UNAVAILABLE)";
+            return;
+        }
+        swapButton.disabled = false;
+        const mirrored = currentMapVariant === definition.mirroredVariant;
+        swapButton.setAttribute("aria-pressed", String(mirrored));
+        swapButton.textContent = mirrored ? "RESTORE SIDES" : "SWAP SIDES";
+    }
+
+    function selectedPresetId() {
+        return document.getElementById("scenario-options")?.value ||
+            globalPresetData.presets?.[0]?.id || "";
+    }
+
+    function presetDisplayName(presetId) {
+        return globalPresetData.presets?.find(preset => preset.id === presetId)
+            ?.label || presetId;
+    }
+
+    function presetBrLabel(preset) {
+        // Mission balance levels map to BR in one-third steps: BR = 1 + rank/3.
+        // Prefer an explicit BR supplied by generated data, but derive it from
+        // the mission rank range when that field is absent.
+        const raw = preset?.br ?? preset?.battle_rating ?? preset?.battleRating;
+        if (Array.isArray(raw)) {
+            const values = raw
+                .filter(value => value !== null && value !== undefined && String(value).trim())
+                .map(value => String(value).replace(/^\[|\]$/g, "").trim());
+            if (values.length) return values.join("] [");
+        }
+        if (raw !== null && raw !== undefined && String(raw).trim()) {
+            return String(raw).replace(/^\[|\]$/g, "").trim();
+        }
+        const range = preset?.rank_range;
+        if (Array.isArray(range) && range.length >= 2) {
+            const eventMinimumBr = 8.7;
+            const toBr = (rank, clampMinimum = false) => {
+                const value = 1 + Number(rank) / 3;
+                return Number.isFinite(value)
+                    ? (clampMinimum ? Math.max(eventMinimumBr, value) : value).toFixed(1)
+                    : "";
+            };
+            const lower = toBr(range[0], true);
+            const upper = toBr(range[1]);
+            if (lower && upper) return `${lower}–${upper}`;
+        }
+        return "BR not set";
+    }
+
+    function populateScenarioSelector() {
+        const options = document.getElementById("scenario-options");
+        const previouslySelected = options.value;
+        options.replaceChildren();
+        const presets = globalPresetData.presets || [];
+        const suffixFor = preset => {
+            const br = presetBrLabel(preset);
+            return br ? `[${br}]` : "";
+        };
+        // Native select options cannot contain flex markup. Right-align the
+        // BR suffixes in the (monospace) list by padding to the longest
+        // entry only, so the closed select stays narrow enough to show the
+        // full BR on phones as well.
+        const width = Math.max(0, ...presets.map(preset =>
+            preset.label.length + suffixFor(preset).length + 1
+        ));
+        presets.forEach(preset => {
+            const option = document.createElement("option");
+            option.value = preset.id;
+            const suffix = suffixFor(preset);
+            const gap = suffix
+                ? "\u00a0".repeat(Math.max(1, width - preset.label.length - suffix.length))
+                : "";
+            option.textContent = `${preset.label}${gap}${suffix}`;
+            options.append(option);
+        });
+        options.disabled = !presets.length;
+        // A remembered scenario can disappear after a datamine update; only
+        // restore ids that still exist.
+        const restoredId = [previouslySelected, uiState.scenario]
+            .find(id => presets.some(preset => preset.id === id));
+        options.value = restoredId || presets[0]?.id || "";
+        options.onchange = event => {
+            saveUiState({ scenario: event.target.value });
+            renderMapData(event.target.value);
+        };
+    }
+
+    function clearVariantLayers() {
+        clearSelectedRanges();
+        renderedGroups.forEach(group => group.clearLayers());
+        Object.values(missionGroups).forEach(groups => {
+            Object.values(groups).forEach(category => {
+                Object.values(category).forEach(group => group.clearLayers());
+            });
+        });
+        // Route groups can be added to the map temporarily when a depot is
+        // selected. Remove those layers before forgetting their references;
+        // otherwise a side/map swap leaves the old convoy lines visible.
+        autoRouteGroups.forEach(group => map.removeLayer(group));
+        autoRouteGroups.clear();
+        routeVisibilityKeys = null;
+        routeVisuals.clear();
+        selectedRouteKeys = new Set();
+        selectedDepotGroup.clearLayers();
+        selectedDepotName = null;
+    }
+
+    function activateMapVariant(variantId) {
+        const definition = activeMapDefinition();
+        if (
+            !definition.variants.includes(variantId) ||
+            !globalMapVariants[variantId] ||
+            !globalMissionLogicVariants[variantId]
+        ) {
+            variantId = definition.defaultVariant;
+        }
+        currentMapVariant = variantId;
+        saveUiState({ mapVariant: currentMapVariant });
+        globalSiteData = globalMapVariants[currentMapVariant];
+        globalMissionLogic = globalMissionLogicVariants[currentMapVariant];
+        globalSiteLocations = locationsByName(globalSiteData);
+        clearVariantLayers();
+        asphaltRoadGroup.clearLayers();
+        gravelRoadGroup.clearLayers();
+        const roads = definition.supportsRoads
+            ? (globalRoadDataByMap[currentMapId] || globalRoadData)
+            : [];
+        drawRoadNetwork(roads);
+        // Convoys use vehicle road splines wherever available.  The City
+        // navmesh is useful as a fallback for off-road armoured movement, but
+        // its triangle-centre shortest path can cut across streets and fields.
+        globalRoadGraph = definition.supportsRoads ? buildRoadGraph(roads) : null;
+        globalNavmeshGraph = definition.supportsNavmesh
+            ? buildNavmeshGraph(globalNavmeshDataByMap[currentMapId])
+            : null;
+        globalConvoyRoutes = definition.supportsRoads && globalRoadGraph ? buildRoadRoutes(
+            globalRoadGraph,
+            globalMissionLogic.likely_convoy_links || [],
+            convoyRouteKey
+        ) : new Map();
+        globalArmoredRoutes = definition.supportsRoads && (globalRoadGraph || globalNavmeshGraph) ? buildRoadRoutes(
+            globalRoadGraph || globalNavmeshGraph,
+            globalMissionLogic.likely_armored_links || [],
+            armoredRouteKey
+        ) : new Map();
+        updateTeamSwapUi();
+        drawMissionLogic(globalMissionLogic);
+        renderMapData(selectedPresetId());
+    }
+
+    function operationalCategory(site) {
+        const templateCategories = {
+            assembly_area: "vehicleDepots",
+            fuel_factory: "fuelAmmoDepots",
+            ammo_factory: "fuelAmmoDepots",
+            strongpoint: "strongpoints",
+            airfield: "airfields"
+        };
+        if (templateCategories[site.category]) return templateCategories[site.category];
+        const siteName = String(site.name || "").toLowerCase();
+        const sourceGroup = String(site.source_group || "").toLowerCase();
+        if (sourceGroup === "ships") return "fleet";
+        if (
+            sourceGroup === "tankmodels" &&
+            (
+                siteName.includes("tactical_missile") ||
+                siteName.includes("tbm") ||
+                siteName.includes("mlrs")
+            )
+        ) return "strategic";
+        if (siteName.includes("longrange_radar")) return "ewRadars";
+        if (siteName.includes("airfield")) return "airfields";
+        if (
+            siteName.includes("fuel_storage") ||
+            siteName.includes("ammo_storage")
+        ) return "fuelAmmoDepots";
+        if (/t[12]_base_/.test(siteName)) return "vehicleDepots";
+        if (siteName.includes("long_sam_site")) return "longSams";
+        if (
+            siteName.includes("short_sam_site") ||
+            siteName.includes("sam_cover_foundation") ||
+            siteName.includes("spaa_cover_foundation")
+        ) return "shortSams";
+        return "strongpoints";
+    }
+
+    function drawRunway(runway, site) {
+        const team = site.team;
+        const [startX, , startZ] = runway.start;
+        const [endX, , endZ] = runway.end;
+        const width = runway.width || 80;
+        const dx = endX - startX;
+        const dz = endZ - startZ;
+        const length = Math.hypot(dx, dz);
+        if (!length) return;
+
+        const normalX = -dz / length;
+        const normalZ = dx / length;
+        const halfWidth = width / 2;
+        const corners = [
+            worldToLatLng(startX + normalX * halfWidth, startZ + normalZ * halfWidth),
+            worldToLatLng(startX - normalX * halfWidth, startZ - normalZ * halfWidth),
+            worldToLatLng(endX - normalX * halfWidth, endZ - normalZ * halfWidth),
+            worldToLatLng(endX + normalX * halfWidth, endZ + normalZ * halfWidth)
+        ];
+
+        // Keep the strip's visual width accurate but give it a generous,
+        // invisible hit area so it remains easy to select at normal zoom.
+        const hitHalfWidth = Math.max(halfWidth * 2.5, 180);
+        const hitCorners = [
+            worldToLatLng(startX + normalX * hitHalfWidth, startZ + normalZ * hitHalfWidth),
+            worldToLatLng(startX - normalX * hitHalfWidth, startZ - normalZ * hitHalfWidth),
+            worldToLatLng(endX - normalX * hitHalfWidth, endZ - normalZ * hitHalfWidth),
+            worldToLatLng(endX + normalX * hitHalfWidth, endZ + normalZ * hitHalfWidth)
+        ];
+
+        const runwayGroup = (missionGroups[team] || missionGroups[1]).airfields.runways;
+        const hitArea = L.polygon(hitCorners, {
+            stroke: false,
+            fill: true,
+            fillColor: teamColor(team),
+            fillOpacity: 0.001,
+            interactive: true
+        }).bindTooltip(`<b>Landing strip</b><br>Width: ${width} m`)
+            .bindPopup(airfieldCardHtml(site), { maxWidth: 360 })
+            .addTo(runwayGroup);
+        // At detail zoom the team-colored strip gets a one-pixel black outer
+        // keyline. The outline is added first so it remains outside the fill.
+        const outline = L.polygon(corners, {
+            color: "#000000",
+            fill: false,
+            weight: 4,
+            opacity: 0,
+            interactive: false
+        }).addTo(runwayGroup);
+        const surface = L.polygon(corners, {
+            color: teamColor(team),
+            fillColor: teamColor(team),
+            fillOpacity: 0.35,
+            weight: 2,
+            interactive: false
+        })
+            .addTo(runwayGroup);
+        runwayOutlineLayersBySite.set(site.name, outline);
+        hitArea.on("click", event => {
+            L.DomEvent.stopPropagation(event);
+            highlightAirfieldRunway(site.name);
+        });
+
+        const centrePoints = [
+            worldToLatLng(startX, startZ),
+            worldToLatLng(endX, endZ)
+        ];
+        const centreLine = L.polyline(centrePoints, {
+            color: "#f6e05e",
+            weight: 2,
+            dashArray: "8, 8",
+            interactive: false
+        }).addTo(runwayGroup);
+        const layers = runwayLayersBySite.get(site.name) || [];
+        layers.push(surface, centreLine);
+        runwayLayersBySite.set(site.name, layers);
+    }
+
+    function drawShipRoute(route, site) {
+        if (!route?.points?.length) return;
+        const positions = route.points.map(point => {
+            const [x, , z] = point.world_pos;
+            return worldToLatLng(x, z);
+        });
+        if (route.closed && positions.length > 1) {
+            positions.push(positions[0]);
+        }
+
+        const color = site.team === 1 ? "#fc8181" : site.team === 2 ? "#90cdf4" : "#cbd5e0";
+        const speed = route.speed == null ? "" : `<br>Stored speed: ${escapeHtml(route.speed)}`;
+        L.polyline(positions, {
+            color,
+            weight: 2,
+            opacity: 0.8,
+            dashArray: "7, 5"
+        }).bindTooltip(`
+            <b>${escapeHtml(site.name)} patrol route</b><br>
+            ${route.points.length} waypoints · ${route.closed ? "closed loop" : "open route"}
+            ${speed}
+        `).addTo((missionGroups[site.team] || missionGroups[1]).fleet.routes);
+    }
+
+    function drawRoadNetwork(roads) {
+        asphaltRoadGroup.clearLayers();
+        gravelRoadGroup.clearLayers();
+
+        roads.forEach(road => {
+            if (!road?.points?.length) return;
+            const positions = road.points.map(point => {
+                const [x, , z] = point;
+                return worldToLatLng(x, z);
+            });
+            const isAsphalt = road.surface === "asphalt";
+            const targetGroup = isAsphalt ? asphaltRoadGroup : gravelRoadGroup;
+            L.polyline(positions, {
+                color: isAsphalt ? "#f7fafc" : "#d6bc8b",
+                weight: isAsphalt ? 1.7 : 1.25,
+                opacity: isAsphalt ? 0.65 : 0.5,
+                interactive: false
+            }).addTo(targetGroup);
+        });
+    }
+
+    function convoyRouteKey(link) {
+        return `convoy::${link.factory}::${link.assembly}`;
+    }
+
+    function armoredRouteKey(link) {
+        return `armored::${link.assembly}::${link.target}`;
+    }
+
+    function worldPathDistance(points) {
+        let total = 0;
+        for (let index = 1; index < points.length; index += 1) {
+            const previous = points[index - 1];
+            const current = points[index];
+            total += Math.hypot(
+                current[0] - previous[0],
+                current[2] - previous[2]
+            );
+        }
+        return total;
+    }
+
+    function makeMinHeap() {
+        const heap = [];
+        return {
+            get size() {
+                return heap.length;
+            },
+            push(priority, node) {
+                let index = heap.length;
+                heap.push([priority, node]);
+                while (index > 0) {
+                    const parent = Math.floor((index - 1) / 2);
+                    if (heap[parent][0] <= priority) break;
+                    heap[index] = heap[parent];
+                    index = parent;
+                }
+                heap[index] = [priority, node];
+            },
+            pop() {
+                if (!heap.length) return null;
+                const root = heap[0];
+                const tail = heap.pop();
+                if (heap.length && tail) {
+                    let index = 0;
+                    while (true) {
+                        const left = index * 2 + 1;
+                        const right = left + 1;
+                        if (left >= heap.length) break;
+                        let child = left;
+                        if (
+                            right < heap.length &&
+                            heap[right][0] < heap[left][0]
+                        ) {
+                            child = right;
+                        }
+                        if (heap[child][0] >= tail[0]) break;
+                        heap[index] = heap[child];
+                        index = child;
+                    }
+                    heap[index] = tail;
+                }
+                return root;
+            }
+        };
+    }
+
+    function buildRoadGraph(roads, joinTolerance = 50) {
+        const nodes = [];
+        const roadIds = [];
+        const edges = [];
+
+        function addEdge(from, to, distance) {
+            edges[from].push([to, distance]);
+            edges[to].push([from, distance]);
+        }
+
+        roads.forEach((road, roadIndex) => {
+            let previousIndex = null;
+            (road.points || []).forEach(point => {
+                const nodeIndex = nodes.length;
+                nodes.push(point);
+                roadIds.push(roadIndex);
+                edges.push([]);
+                if (previousIndex != null) {
+                    addEdge(
+                        previousIndex,
+                        nodeIndex,
+                        Math.hypot(
+                            point[0] - nodes[previousIndex][0],
+                            point[2] - nodes[previousIndex][2]
+                        )
+                    );
+                }
+                previousIndex = nodeIndex;
+            });
+        });
+
+        // Separate spline objects often meet within a few metres without
+        // sharing an identical control point. Join the nearest point from each
+        // neighbouring road inside a small spatial-hash cell.
+        const buckets = new Map();
+        nodes.forEach((point, nodeIndex) => {
+            const cellX = Math.floor(point[0] / joinTolerance);
+            const cellZ = Math.floor(point[2] / joinTolerance);
+            const nearestByRoad = new Map();
+
+            for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+                for (let offsetZ = -1; offsetZ <= 1; offsetZ += 1) {
+                    const bucket = buckets.get(
+                        `${cellX + offsetX}:${cellZ + offsetZ}`
+                    ) || [];
+                    bucket.forEach(otherIndex => {
+                        const otherRoad = roadIds[otherIndex];
+                        if (otherRoad === roadIds[nodeIndex]) return;
+                        const other = nodes[otherIndex];
+                        if (Math.abs(point[1] - other[1]) > 20) return;
+                        const distance = Math.hypot(
+                            point[0] - other[0],
+                            point[2] - other[2]
+                        );
+                        if (distance > joinTolerance) return;
+                        const existing = nearestByRoad.get(otherRoad);
+                        if (!existing || distance < existing.distance) {
+                            nearestByRoad.set(otherRoad, {
+                                nodeIndex: otherIndex,
+                                distance
+                            });
+                        }
+                    });
+                }
+            }
+
+            nearestByRoad.forEach(join => {
+                addEdge(nodeIndex, join.nodeIndex, join.distance);
+            });
+
+            const key = `${cellX}:${cellZ}`;
+            if (!buckets.has(key)) buckets.set(key, []);
+            buckets.get(key).push(nodeIndex);
+        });
+
+        return { nodes, edges, source: "extracted road splines" };
+    }
+
+    function buildNavmeshGraph(mesh) {
+        const vertices = mesh?.vertices || [];
+        const triangles = mesh?.triangles || [];
+        if (!vertices.length || !triangles.length) return null;
+
+        const nodes = triangles.map(triangle => {
+            const points = triangle.map(index => vertices[index]);
+            return [
+                points.reduce((sum, point) => sum + point[0], 0) / points.length,
+                points.reduce((sum, point) => sum + point[1], 0) / points.length,
+                points.reduce((sum, point) => sum + point[2], 0) / points.length
+            ];
+        });
+        const edges = nodes.map(() => []);
+        const edgeOwners = new Map();
+
+        function addEdge(from, to) {
+            if (from === to) return;
+            const distance = Math.hypot(
+                nodes[from][0] - nodes[to][0],
+                nodes[from][2] - nodes[to][2]
+            );
+            if (!Number.isFinite(distance)) return;
+            edges[from].push([to, distance]);
+            edges[to].push([from, distance]);
+        }
+
+        triangles.forEach((triangle, triangleIndex) => {
+            [[0, 1], [1, 2], [2, 0]].forEach(([first, second]) => {
+                const a = triangle[first];
+                const b = triangle[second];
+                const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+                const owners = edgeOwners.get(key) || [];
+                owners.forEach(owner => addEdge(owner, triangleIndex));
+                owners.push(triangleIndex);
+                edgeOwners.set(key, owners);
+            });
+        });
+
+        return {
+            nodes,
+            edges,
+            source: "navigation mesh",
+            triangleCount: triangles.length
+        };
+    }
+
+    function nearestRoadNode(nodes, worldPoint) {
+        let nearestIndex = -1;
+        let nearestDistanceSquared = Infinity;
+        nodes.forEach((node, index) => {
+            const distanceSquared =
+                Math.pow(node[0] - worldPoint[0], 2) +
+                Math.pow(node[2] - worldPoint[2], 2);
+            if (distanceSquared < nearestDistanceSquared) {
+                nearestIndex = index;
+                nearestDistanceSquared = distanceSquared;
+            }
+        });
+        return nearestIndex;
+    }
+
+    function findRoadPath(graph, from, to) {
+        const { nodes, edges } = graph;
+        const start = nearestRoadNode(nodes, from);
+        const goal = nearestRoadNode(nodes, to);
+        if (start < 0 || goal < 0) return null;
+
+        const distance = new Float64Array(nodes.length);
+        distance.fill(Infinity);
+        distance[start] = 0;
+
+        const previous = new Int32Array(nodes.length);
+        previous.fill(-1);
+        const queue = makeMinHeap();
+        queue.push(0, start);
+
+        function heuristic(nodeIndex) {
+            return Math.hypot(
+                nodes[nodeIndex][0] - nodes[goal][0],
+                nodes[nodeIndex][2] - nodes[goal][2]
+            );
+        }
+
+        while (queue.size) {
+            const item = queue.pop();
+            if (!item) break;
+            const [estimatedTotal, current] = item;
+            if (
+                estimatedTotal >
+                distance[current] + heuristic(current) + 0.001
+            ) {
+                continue;
+            }
+            if (current === goal) break;
+
+            edges[current].forEach(([next, edgeDistance]) => {
+                const candidate = distance[current] + edgeDistance;
+                if (candidate >= distance[next]) return;
+                distance[next] = candidate;
+                previous[next] = current;
+                queue.push(candidate + heuristic(next), next);
+            });
+        }
+
+        if (!Number.isFinite(distance[goal])) return null;
+        const nodePath = [];
+        for (let current = goal; current >= 0; current = previous[current]) {
+            nodePath.push(current);
+            if (current === start) break;
+        }
+        if (nodePath[nodePath.length - 1] !== start) return null;
+        nodePath.reverse();
+
+        const worldPoints = [
+            from,
+            ...nodePath.map(nodeIndex => nodes[nodeIndex]),
+            to
+        ];
+        return {
+            worldPoints,
+            distance: worldPathDistance(worldPoints),
+            source: graph.source || "road network",
+            entranceDistance: Math.hypot(
+                from[0] - nodes[start][0],
+                from[2] - nodes[start][2]
+            ),
+            exitDistance: Math.hypot(
+                to[0] - nodes[goal][0],
+                to[2] - nodes[goal][2]
+            )
+        };
+    }
+
+    function buildRoadRoutes(graph, links, keyFunction) {
+        const routes = new Map();
+        links.forEach(link => {
+            const route = findRoadPath(graph, link.from, link.to);
+            if (route) routes.set(keyFunction(link), route);
+        });
+        return routes;
+    }
+
+    function convoyRoute(link) {
+        if (link.locationSwapped && globalRoadGraph) {
+            const swappedRoadRoute = findRoadPath(
+                globalRoadGraph,
+                link.from,
+                link.to
+            );
+            if (swappedRoadRoute) return swappedRoadRoute;
+        }
+        const extracted = globalConvoyRoutes.get(convoyRouteKey(link));
+        if (extracted) return extracted;
+        const navmeshRoute = globalNavmeshGraph
+            ? findRoadPath(globalNavmeshGraph, link.from, link.to)
+            : null;
+        if (navmeshRoute) return navmeshRoute;
+        return {
+            worldPoints: [link.from, link.to],
+            distance: worldPathDistance([link.from, link.to]),
+            source: "direct fallback",
+            entranceDistance: 0,
+            exitDistance: 0
+        };
+    }
+
+    function armoredRoute(link) {
+        if (link.locationSwapped && globalRoadGraph) {
+            const swappedRoadRoute = findRoadPath(
+                globalRoadGraph,
+                link.from,
+                link.to
+            );
+            if (swappedRoadRoute) return swappedRoadRoute;
+        }
+        const extractedRoute = globalArmoredRoutes.get(
+            armoredRouteKey(link)
+        );
+        if (extractedRoute) return extractedRoute;
+        const roadRoute = (
+            (globalRoadGraph || globalNavmeshGraph) &&
+            link?.from?.length >= 3 &&
+            link?.to?.length >= 3
+        ) ? findRoadPath(globalRoadGraph || globalNavmeshGraph, link.from, link.to) : null;
+        if (roadRoute) {
+            globalArmoredRoutes.set(armoredRouteKey(link), roadRoute);
+            return roadRoute;
+        }
+        // Same fallback order as convoys: roads first, then the navmesh.
+        const navmeshRoute = globalRoadGraph && globalNavmeshGraph &&
+            link?.from?.length >= 3 && link?.to?.length >= 3
+            ? findRoadPath(globalNavmeshGraph, link.from, link.to)
+            : null;
+        if (navmeshRoute) {
+            globalArmoredRoutes.set(armoredRouteKey(link), navmeshRoute);
+            return navmeshRoute;
+        }
+        return {
+            worldPoints: [link.from, link.to],
+            distance: worldPathDistance([link.from, link.to]),
+            source: "direct fallback",
+            entranceDistance: 0,
+            exitDistance: 0
+        };
+    }
+
+    function applyRouteStyle(routeVisual, hovered = false) {
+        const visible = routeVisibilityKeys === null ||
+            routeVisibilityKeys.has(routeVisual.key);
+        const selected = selectedRouteKeys.has(routeVisual.key);
+        routeVisual.line.setStyle({
+            weight: selected ? 3.7 : hovered ? 3 : routeVisual.baseWeight,
+            opacity: visible ? (selected ? 1 : hovered ? 0.95 : routeVisual.baseOpacity) : 0
+        });
+        routeVisual.halo.setStyle({
+            opacity: visible ? (selected ? 0.72 : hovered ? 0.34 : 0) : 0,
+            weight: selected ? 7 : 6
+        });
+        routeVisual.hitLine.setStyle({ opacity: visible ? 0.001 : 0 });
+    }
+
+    function refreshRouteHighlights() {
+        routeVisuals.forEach(routeVisual => applyRouteStyle(routeVisual));
+    }
+
+    function clearRouteSelection() {
+        selectedRouteKeys = new Set();
+        selectedDepotName = null;
+        selectedDepotGroup.clearLayers();
+        // A blank-map click is the explicit way to dismiss route context.
+        // Keep the route context through zoom changes, but remove any
+        // route layers that were added automatically for an overview site.
+        autoRouteGroups.forEach(group => map.removeLayer(group));
+        autoRouteGroups.clear();
+        routeVisibilityKeys = null;
+        refreshRouteHighlights();
+    }
+
+    function showRoutesForOverviewSite(entry) {
+        const category = operationalCategory(entry.site);
+        const mission = missionGroups[entry.site.team] || missionGroups[1];
+        const routeGroups = category === "fuelAmmoDepots"
+            ? [mission.fuelAmmoDepots.convoy]
+            : category === "vehicleDepots"
+                // Vehicle assembly areas are endpoints for both the initial
+                // armoured columns and the resource convoys that supply them.
+                ? [mission.vehicleDepots.armored, mission.fuelAmmoDepots.convoy]
+                : [];
+        if (!routeGroups.length) return;
+
+        routeGroups.forEach(routeGroup => {
+            if (!map.hasLayer(routeGroup)) {
+                routeGroup.addTo(map);
+                autoRouteGroups.add(routeGroup);
+            }
+        });
+        const siteNames = new Set(entry.siteNames);
+        routeVisibilityKeys = new Set(
+            [...routeVisuals.values()]
+                .filter(route => route.endpoints.some(name => siteNames.has(name)))
+                .map(route => route.key)
+        );
+        selectedRouteKeys = new Set(routeVisibilityKeys);
+        refreshRouteHighlights();
+    }
+
+    function clearAutoRouteGroups() {
+        autoRouteGroups.forEach(group => map.removeLayer(group));
+        autoRouteGroups.clear();
+        routeVisibilityKeys = null;
+        selectedRouteKeys = new Set();
+        selectedDepotName = null;
+        selectedDepotGroup.clearLayers();
+        refreshRouteHighlights();
+    }
+
+    function stopLeafletClick(event) {
+        if (event?.originalEvent) {
+            // Stop the container-level map click as well as the marker's
+            // native event. Without this, selecting a unit can immediately
+            // run the empty-map cleanup path and remove its focused detail.
+            L.DomEvent.stop(event.originalEvent);
+        }
+    }
+
+    function selectRoute(routeKey, event) {
+        stopLeafletClick(event);
+        selectedDepotName = null;
+        selectedDepotGroup.clearLayers();
+        selectedRouteKeys = selectedRouteKeys.has(routeKey)
+            ? new Set()
+            : new Set([routeKey]);
+        refreshRouteHighlights();
+    }
+
+    function selectDepotRoutes(site, position, event, force = false) {
+        stopLeafletClick(event);
+        const wasSelected = selectedDepotName === site.name;
+        selectedDepotGroup.clearLayers();
+        selectedDepotName = !force && wasSelected ? null : site.name;
+        selectedRouteKeys = new Set();
+
+        if (!wasSelected || force) {
+            routeVisuals.forEach(routeVisual => {
+                if (routeVisual.endpoints.includes(site.name)) {
+                    selectedRouteKeys.add(routeVisual.key);
+                    L.polyline(routeVisual.positions, {
+                        color: "#f7fafc",
+                        weight: 7,
+                        opacity: 0.72,
+                        dashArray: routeVisual.dashArray,
+                        interactive: false
+                    }).addTo(selectedDepotGroup);
+                    L.polyline(routeVisual.positions, {
+                        color: routeVisual.color,
+                        weight: 3.7,
+                        opacity: 1,
+                        dashArray: routeVisual.dashArray,
+                        interactive: false
+                    }).addTo(selectedDepotGroup);
+                }
+            });
+            L.circleMarker(position, {
+                pane: "strategicTargets",
+                radius: 20,
+                color: "#f7fafc",
+                fill: false,
+                weight: 3,
+                opacity: 0.9,
+                interactive: false
+            }).addTo(selectedDepotGroup);
+        }
+        refreshRouteHighlights();
+    }
+
+    function drawSelectableRoute({
+        key,
+        endpoints,
+        route,
+        color,
+        dashArray,
+        tooltip,
+        group,
+        baseWeight = 2,
+        baseOpacity = 0.72
+    }) {
+        const positions = route.worldPoints.map(point =>
+            worldToLatLng(point[0], point[2])
+        );
+        const halo = L.polyline(positions, {
+            color: "#f7fafc",
+            weight: 6,
+            opacity: 0,
+            dashArray,
+            interactive: false
+        }).addTo(group);
+        const line = L.polyline(positions, {
+            color,
+            weight: baseWeight,
+            opacity: baseOpacity,
+            dashArray,
+            interactive: false
+        }).addTo(group);
+        const hitLine = L.polyline(positions, {
+            color: "#ffffff",
+            weight: 16,
+            opacity: 0.001
+        }).bindTooltip(tooltip).addTo(group);
+        const routeVisual = {
+            key,
+            endpoints,
+            line,
+            halo,
+            hitLine,
+            positions,
+            color,
+            dashArray,
+            baseWeight,
+            baseOpacity
+        };
+        routeVisuals.set(key, routeVisual);
+        hitLine.on("mouseover", () => applyRouteStyle(routeVisual, true));
+        hitLine.on("mouseout", () => applyRouteStyle(routeVisual));
+        hitLine.on("click", event => selectRoute(key, event));
+        return routeVisual;
+    }
+
+    function teamColor(team) {
+        return team === 1 ? "#e53e3e" : team === 2 ? "#4299e1" : "#a0aec0";
+    }
+
+    function isGroundUnit(unit, site) {
+        return site.source_group !== "ships" &&
+            String(unit.role || "").toLowerCase() !== "ship";
+    }
+
+    function showRangeDisclaimer(selectionKey) {
+        rangeDisclaimerSelectionKey = selectionKey;
+        rangeDisclaimerElement?.classList.add("is-visible");
+    }
+
+    function toggleSelectedUnitRanges(selectionKey, position, unit, site, specs) {
+        if (selectedRangeLayers.has(selectionKey)) {
+            selectedRangeGroup.removeLayer(selectedRangeLayers.get(selectionKey));
+            selectedRangeLayers.delete(selectionKey);
+            return "removed";
+        }
+        if (!specs) return "unavailable";
+
+        const color = teamColor(site.team);
+        const unitRanges = L.layerGroup();
+        const threatSearch = Number(unit?.threat_range);
+        const ranges = [
+            {
+                value: threatSearch > 0
+                    ? threatSearch
+                    : specs.sensors?.detection?.nominal ||
+                        Math.max(...(specs.sensors?.detection?.scope_ranges || []), 0),
+                label: "Radar detection",
+                style: {
+                    color,
+                    weight: 2,
+                    opacity: 0.9,
+                    fill: false,
+                    dashArray: "9, 6"
+                }
+            },
+            {
+                value: specs.sensors?.tracking?.nominal,
+                label: "Radar tracking",
+                style: {
+                    color,
+                    weight: 2,
+                    opacity: 0.95,
+                    fill: false,
+                    dashArray: "2, 5"
+                }
+            },
+            {
+                value: displayEngagementRange(unit, specs),
+                label: "Weapon engagement",
+                style: {
+                    color,
+                    fillColor: color,
+                    fillOpacity: 0.045,
+                    weight: 2.25,
+                    opacity: 1
+                }
+            }
+        ];
+
+        ranges.forEach(range => {
+            const radius = Number(range.value);
+            if (!(radius > 0)) return;
+            L.circle(position, {
+                radius: worldRadiusToMapRadius(radius),
+                interactive: false,
+                ...range.style
+            }).addTo(unitRanges);
+        });
+
+        if (!unitRanges.getLayers().length) return "unavailable";
+        L.circleMarker(position, {
+            radius: 17,
+            color: "#ffffff",
+            fill: false,
+            weight: 2,
+            opacity: 0.95,
+            dashArray: "3, 3",
+            interactive: false
+        }).addTo(unitRanges);
+        unitRanges.addTo(selectedRangeGroup);
+        selectedRangeLayers.set(selectionKey, unitRanges);
+        return "shown";
+    }
+
+    function iconTypeForFamily(type, family) {
+        const value = String(type || "tank").toLowerCase();
+        if (family === "vanilla") {
+            return ({
+                tank: "tracked",
+                tank_radar_target: "tracked_radar_target",
+                tank_storage: "structure",
+                fuel_storage: "structure",
+                ammo_storage: "structure",
+                radar_station: "spaa",
+                radar_station_radar_target: "spaa_radar_target",
+                sam: "spaa",
+                sam_radar_target: "spaa_radar_target",
+                tbm: "tank_destroyer",
+                mlrs: "tank_destroyer",
+                ifv: "light_tank",
+                truck: "wheeled",
+                aircraft_carrier: "ship",
+                battleship: "ship",
+                missile_cruiser: "ship",
+                heavy_cruiser: "ship",
+                cruiser: "ship",
+                destroyer: "ship",
+                frigate: "ship",
+                corvette: "ship",
+                boat: "ship"
+            })[value] || value;
+        }
+        if (family === "pact") {
+            return ({
+                structure: "ammo_storage",
+                ammo_storage: "ammo_storage",
+                tank_radar_target: "tank_radar_target",
+                sam_radar_target: "sam_radar_target",
+                missile_light_cruiser: "missile_cruiser",
+                missile_corvette: "corvette",
+                missile_destroyer: "destroyer",
+                gun_boat: "boat",
+                torpedo_gun_boat: "boat"
+            })[value] || value;
+        }
+        // NATO's role set uses the same fallback for naval sub-classes that
+        // do not have a dedicated ally symbol.
+        return ({
+            missile_light_cruiser: "missile_cruiser",
+            missile_corvette: "corvette",
+            missile_destroyer: "destroyer",
+            gun_boat: "boat",
+            torpedo_gun_boat: "boat"
+        })[value] || value;
+    }
+
+    const ICON_TYPES_BY_FAMILY = {
+        vanilla: new Set(["tracked", "tracked_radar_target", "spaa", "spaa_radar_target", "structure", "wheeled", "light_tank", "tank_destroyer", "ship"]),
+        pact: new Set(["tank", "spaa", "sam", "radar_station", "truck", "ifv", "mlrs", "tbm", "tank_destroyer", "ship", "boat", "destroyer", "missile_cruiser", "corvette", "aircraft_carrier", "battleship", "cruiser", "frigate", "heavy_cruiser", "fuel_storage", "tank_storage", "ammo_storage", "tank_radar_target", "sam_radar_target", "radar_station_radar_target"]),
+        nato: new Set(["tank", "spaa", "sam", "radar_station", "truck", "ifv", "mlrs", "tbm", "tank_destroyer", "ship", "boat", "destroyer", "missile_cruiser", "corvette", "aircraft_carrier", "battleship", "cruiser", "frigate", "heavy_cruiser", "fuel_storage", "tank_storage", "ammo_storage", "tank_radar_target"])
+    };
+
+    function activeIconFamily() {
+        return iconFamily === "vanilla" || iconFamily === "pact" ? iconFamily : "nato";
+    }
+
+    function iconRenderSize(size = 30) {
+        const requested = Number(size) > 0 ? Number(size) : 30;
+        // WT's original HUD symbols are compact, while NATO and USSR use the
+        // larger tactical-symbol footprint.
+        return activeIconFamily() === "vanilla"
+            ? Math.min(requested, 20)
+            : Math.min(requested, 30);
+    }
+
+    // Icon fills are role-based rather than hardcoded into individual
+    // renderers. Add a new role here when another site/unit category needs a
+    // distinct team palette; callers only need to pass `colorRole`.
+    const ICON_TEAM_PALETTES = {
+        default: { 1: "#fc8181", 2: "#90cdf4" },
+        "sam-site": { 1: "#fc8181", 2: "#90cdf4" }
+    };
+
+    function iconTeamFill(team, colorRole = "default") {
+        const palette = ICON_TEAM_PALETTES[colorRole] || ICON_TEAM_PALETTES.default;
+        return palette[team] || "#fdfcff";
+    }
+
+    function vectorIconDataUri(team, family, path, colorRole = "default") {
+        const fileName = String(path).split("/").pop();
+        const source = globalIconTemplates[family]?.[fileName];
+        if (!source) return null;
+        const color = iconTeamFill(team, colorRole);
+        // Replace only the white symbol fill. Black outlines/detail paths are
+        // deliberately preserved from the original vector artwork.
+        let recolored = source.replace(/(#fdfcff|#fff(?:fff)?|white)/gi, color);
+        // WT symbols are tiny native SVGs. Add the black keyline in vector
+        // space so it remains a true one-pixel stroke after enlargement,
+        // instead of stacking several raster drop-shadows.
+        if (family === "vanilla") {
+            recolored = recolored.replace(
+                new RegExp(`fill=["']${color}["']`, "gi"),
+                match => `${match} stroke="#000" stroke-width="0.5" stroke-linejoin="round" paint-order="stroke fill"`
+            );
+        }
+        // The compact WT SVGs omit an XML namespace because the game loads
+        // them as native UI assets. Data-URI image documents need the
+        // namespace explicitly or Chromium treats them as broken images.
+        if (!/\bxmlns\s*=/.test(recolored)) {
+            recolored = recolored.replace(
+                /<svg\b/i,
+                '<svg xmlns="http://www.w3.org/2000/svg"'
+            );
+        }
+        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(recolored)}`;
+    }
+
+    function natoIconPath(team, iconType, options = {}) {
+        const family = activeIconFamily();
+        let type = iconTypeForFamily(iconType, family);
+        // A few legacy entries use a semantic type that is not a filename in
+        // every icon family.  Fall back to a valid generic role
+        // rather than requesting a missing image (which shows the browser's
+        // broken-image placeholder).
+        const available = ICON_TYPES_BY_FAMILY[family];
+        if (!available.has(type)) {
+            const radarTarget = type.endsWith("_radar_target");
+            type = family === "vanilla"
+                ? (radarTarget ? "tracked_radar_target" : "tracked")
+                : (radarTarget ? "tank_radar_target" : "tank");
+        }
+        // Radar-target symbols already carry their suffix in the filename
+        // (def_ussr_tank_radar_target.svg); everything else ends in _radar.
+        const suffix = type.endsWith("_radar_target") ? "" : "_radar";
+        let path;
+        if (family === "vanilla") {
+            path = `images/icons/vanilla/def_${type}${suffix}.svg`;
+        } else if (family === "pact") {
+            path = `images/icons/pact/def_ussr_${type}${suffix}.svg`;
+        } else {
+            const side = team === 1 ? "enemy" : "ally";
+            path = `images/icons/nato/def_nato_${side}_${type}${suffix}.svg`;
+        }
+        const vectorSource = vectorIconDataUri(
+            team,
+            family,
+            path,
+            options?.colorRole || "default"
+        );
+        if (vectorSource) return vectorSource;
+        // Fallback while templates are unavailable (for example during a
+        // development hot reload). The source SVG remains usable directly.
+        return `${path}?team=${team || 0}`;
+    }
+
+    function natoIcon(team, iconType, size = 30, options = {}) {
+        const path = natoIconPath(team, iconType, options);
+        const family = activeIconFamily();
+        const renderSize = iconRenderSize(size);
+        return L.divIcon({
+            className: "nato-leaflet-icon",
+            html: `<img data-icon-family="${family}" data-icon-size="${renderSize}" style="width:${renderSize}px;height:${renderSize}px" src="${path}" alt="">`,
+            iconSize: [size, size],
+            iconAnchor: [size / 2, size / 2],
+            tooltipAnchor: [0, -size / 2]
+        });
+    }
+
+    function bomberIcon(team) {
+        const fileName = team === 1 ? "tu_95m_ico.svg" : "b_52h_ico.svg";
+        const path = `images/icons/aircraft/${fileName}`;
+        const vectorSource = vectorIconDataUri(team, "aircraft", path);
+        return L.divIcon({
+            className: "nato-leaflet-icon bomber-map-icon",
+            html: `<img src="${vectorSource || path}" alt="">`,
+            iconSize: [36, 36],
+            iconAnchor: [18, 18],
+            tooltipAnchor: [0, -18]
+        });
+    }
+
+    function shipIconType(name) {
+        const value = String(name).toLowerCase();
+        if (value.includes("aircraftcarrier") || value.includes("aircraft_carrier")) return "aircraft_carrier";
+        if (value.includes("battleship")) return "battleship";
+        if (value.includes("missile_cruiser")) return "missile_cruiser";
+        if (value.includes("heavy_cruiser")) return "heavy_cruiser";
+        if (value.includes("cruiser")) return "cruiser";
+        if (value.includes("destroyer")) return "destroyer";
+        if (value.includes("frigate")) return "frigate";
+        if (value.includes("corvette")) return "corvette";
+        return "boat";
+    }
+
+    function unitIconType(unit, site) {
+        const role = String(unit.role || "").toLowerCase();
+        const name = String(unit.name || "").toLowerCase();
+        if (site.source_group === "ships" || role === "ship") return shipIconType(name);
+        const spec = globalUnitSpecs[name];
+        const radarClass = String(spec?.on_radar_as || "").toLowerCase();
+        const radarClassMap = {
+            sam: "sam",
+            radar: "radar_station",
+            tracked: "tank",
+            ifv: "ifv",
+            wheeled: "truck",
+            mlrs: "mlrs",
+            tbm_launcher: "tbm",
+            missile_destroyer: "destroyer",
+            missile_light_cruiser: "missile_cruiser",
+            missile_corvette: "corvette"
+        };
+        if (radarClassMap[radarClass]) return radarClassMap[radarClass];
+        const unitType = String(spec?.unit_type || "").toLowerCase();
+        const unitTypeMap = {
+            typespaa: "spaa",
+            typelighttank: "tank",
+            typemediumtank: "tank",
+            typetankdestroyer: "tank_destroyer",
+            typedestroyer: "destroyer",
+            typeship: "ship",
+            typegunboat: "boat",
+            typetorpedogunboat: "boat"
+        };
+        if (unitTypeMap[unitType]) return unitTypeMap[unitType];
+        if (name.includes("tactical_missile") || name.includes("tbm_")) return "tbm";
+        if (name.includes("mlrs") || name.includes("smerch") || name.includes("m270")) return "mlrs";
+        if (role.includes("radar") || name.includes("radar")) return "radar_station";
+        if (role.includes("launcher") || name.includes("_sam_")) return "sam";
+        if (role === "spaa" || name.includes("zprk") || name.includes("flarak") || name.includes("crotale")) return "spaa";
+        if (name.includes("bmp") || name.includes("bradley")) return "ifv";
+        if (
+            name.includes("truck") || name.includes("kamaz") ||
+            name.includes("m978") || name.includes("m939") ||
+            name.includes("carrier") || name.includes("wheeled_vehicles")
+        ) return "truck";
+        return "tank";
+    }
+
+    const NATO_RADAR_BANDS = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"
+    ];
+    const WIKI_IMAGE_BASE = "images/portraits/";
+    const SLOT_IMAGE_BASE = "images/slots/";
+    const PORTRAIT_IMAGE_BASE = "images/portraits/";
+    // Event naval entries sometimes use an `_ec`/`_ai` suffix even though
+    // their playable encyclopedia entry uses the base class name.
+    const PLAYABLE_IMAGE_ALIASES = {
+        us_destroyer_cf_adams_class_cf_adams_ec: "us_destroyer_cf_adams_class_cf_adams",
+        ussr_destroyer_pr56_bravy_ec: "ussr_destroyer_pr56_bravy",
+        ussr_mpk_pr_1124_ec: "ussr_mpk_pr_1124",
+        us_aircraftcarrier_forrestal_ai: "us_aircraftcarrier_forrestal",
+        ussr_aircraftcarrier_admiral_kuznetsov_ai: "ussr_aircraftcarrier_admiral_kuznetsov",
+        ussr_aircraftcarrier_baku_ai: "ussr_aircraftcarrier_baku"
+    };
+
+    function natoRadarBand(band) {
+        if (Array.isArray(band)) {
+            const labels = band
+                .map(natoRadarBand)
+                .filter(label => label !== "Band unknown");
+            return labels.length ? [...new Set(labels)].join(" / ") : "Band unknown";
+        }
+        const index = Number(band);
+        return Number.isInteger(index) && NATO_RADAR_BANDS[index]
+            ? `${NATO_RADAR_BANDS[index]}-band`
+            : "Band unknown";
+    }
+
+    function modelArtUrls(model) {
+        const modelName = String(model || "")
+            .replaceAll("\\", "/")
+            .split("/")
+            .pop()
+            .replace(/\.(blkx?|dag)$/i, "")
+            .toLowerCase();
+        if (!modelName) return [];
+        // Portraits use the extracted model name directly. This keeps the
+        // local asset names readable instead of exposing CDK's screenshot
+        // filename convention.
+        return [`${PORTRAIT_IMAGE_BASE}${modelName}.png`];
+    }
+
+    function slotImageNames(name, model) {
+        const normalize = value => String(value || "")
+            .replaceAll("\\", "/")
+            .split("/")
+            .pop()
+            .toLowerCase()
+            .replace(/\.(blkx?|dag)$/i, "");
+        const values = [normalize(model), normalize(name)].filter(Boolean);
+        const names = [];
+        values.forEach(raw => {
+            const aliases = PLAYABLE_IMAGE_ALIASES[raw];
+            [raw, aliases].filter(Boolean).forEach(value => {
+                if (!names.includes(value)) names.push(value);
+            });
+        });
+        return names;
+    }
+
+    function slotArtUrls(name, model) {
+        return slotImageNames(name, model).map(
+            slotName => `${SLOT_IMAGE_BASE}${slotName}.png`
+        );
+    }
+
+    function encyclopediaName(name) {
+        const raw = String(name || "").toLowerCase();
+        if (!raw) return null;
+        if (PLAYABLE_IMAGE_ALIASES[raw]) return PLAYABLE_IMAGE_ALIASES[raw];
+        // Directory-qualified mission classes (especially convoy trucks) do
+        // not have encyclopedia entries under that literal slash-separated
+        // name. Their card art is resolved from the extracted model instead.
+        if (raw.includes("/")) return null;
+        // AI-only mission objects have no guaranteed encyclopedia entry.
+        if (raw.includes("_ai_") || raw.endsWith("_ai")) return null;
+        return raw.replace(/_ec$/, "");
+    }
+
+    function vehicleImageSources(name) {
+        const value = String(name || "").toLowerCase();
+        const sourceModel = globalUnitSpecs[value]?.model;
+        const modelArt = modelArtUrls(sourceModel);
+        const playableValue = encyclopediaName(value);
+        const wikiArt = playableValue
+            ? `${WIKI_IMAGE_BASE}${encodeURIComponent(playableValue)}.png`
+            : null;
+        const candidates = [...modelArt].filter(Boolean);
+        const sources = usableImageSources(candidates);
+        // `missing`: art exists in principle but every candidate already
+        // failed, so cards keep their art slot (and its badges) as no-art.
+        return {
+            src: sources[0] || null,
+            fallbacks: sources.slice(1),
+            missing: candidates.length > 0 && !sources.length
+        };
+    }
+
+    function vehicleHoverImageUrl(name) {
+        return slotArtUrls(name)[0] || null;
+    }
+
+    // Image candidates that already failed on this page. Tooltip and card
+    // HTML is rebuilt every time it opens, so without this list each open
+    // requested the same missing slot/portrait files again.
+    const failedImageUrls = new Set();
+
+    function usableImageSources(sources) {
+        return [...new Set((sources || []).filter(Boolean))]
+            .filter(source => !failedImageUrls.has(source));
+    }
+
+    // Shared onerror handler for card and tooltip images. Remembers the
+    // failed URL, tries the next untried candidate, and otherwise applies
+    // the missing state: `hide` keeps the element but drops its source,
+    // `remove` deletes it and marks the parent as having no artwork.
+    function handleImageError(image, missing = "hide") {
+        const failed = image.getAttribute("src");
+        if (failed) failedImageUrls.add(failed);
+        const next = usableImageSources((image.dataset.fallbacks || "").split("|"));
+        if (next.length) {
+            image.dataset.fallbacks = next.slice(1).join("|");
+            image.src = next[0];
+            return;
+        }
+        if (missing === "remove") {
+            const parent = image.parentElement;
+            image.remove();
+            parent?.classList.add("no-art");
+        } else {
+            image.classList.add("is-missing");
+            image.removeAttribute("src");
+        }
+    }
+
+    function fallbackImageHtml(sources, className, alt = "") {
+        const uniqueSources = usableImageSources(sources);
+        if (!uniqueSources.length) return "";
+        const primary = uniqueSources[0];
+        const fallbacks = uniqueSources.slice(1).join("|");
+        // Every missing candidate is tried at most once per page. The old
+        // hover handler assigned the same missing `_char` URL repeatedly,
+        // which produced an endless stream of console/network errors.
+        return `<img class="${escapeHtml(className)}" src="${escapeHtml(primary)}" alt="${escapeHtml(alt)}"
+            data-fallbacks="${escapeHtml(fallbacks)}"
+            onerror="handleImageError(this)">`;
+    }
+
+    function drawLogicSite(site) {
+        const [x, , z] = site.world_pos;
+        const position = worldToLatLng(x, z);
+        const labels = {
+            fuel_factory: "Fuel factory",
+            ammo_factory: "Ammunition factory",
+            assembly_area: "Assembly area",
+            strongpoint: "Strongpoint",
+            airfield: "Airfield"
+        };
+        const category = labels[site.category] || displayName(site.category);
+        const tooltip = `
+            <b>${escapeHtml(site.name)}</b><br>
+            ${escapeHtml(category)} · Team ${escapeHtml(site.team)}<br>
+            Capture radius: ${Number(site.capture_radius).toFixed(0)} m
+        `;
+
+        const teamMission = missionGroups[site.team] || missionGroups[1];
+        let categoryGroup = null;
+        let iconType = null;
+        if (site.category === "fuel_factory") {
+            categoryGroup = teamMission.fuelAmmoDepots;
+            iconType = "fuel_storage";
+        } else if (site.category === "ammo_factory") {
+            categoryGroup = teamMission.fuelAmmoDepots;
+            iconType = "ammo_storage";
+        } else if (site.category === "assembly_area") {
+            categoryGroup = teamMission.vehicleDepots;
+            iconType = "tank_storage";
+        } else if (site.category === "strongpoint") {
+            categoryGroup = teamMission.strongpoints;
+        } else if (site.category === "airfield") {
+            categoryGroup = teamMission.airfields;
+        }
+
+        if (categoryGroup && iconType) {
+            const marker = L.marker(position, {
+                icon: natoIcon(site.team, iconType, 32),
+                pane: "depotMarkers",
+                zIndexOffset: 300,
+                riseOnHover: true
+            }).bindTooltip(
+                `${tooltip}<br><i>Click to highlight this depot's routes</i>`
+            ).addTo(categoryGroup.objectives);
+            const sourceSite = globalSiteLocations.get(site.name);
+            const mainBuildingFor = presetId =>
+                sourceSite?.buildings_by_era?.[presetId]?.[0];
+            const hasBuildingCard = Object.keys(sourceSite?.buildings_by_era || {}).some(presetId =>
+                BUILDING_CARD_DATA[String(mainBuildingFor(presetId)?.name || "").toLowerCase()]
+            );
+            if (hasBuildingCard) {
+                // Resolve the card when it opens so it follows the currently
+                // selected scenario rather than the one active at draw time.
+                marker.bindPopup(() => {
+                    const mainBuilding = mainBuildingFor(selectedPresetId());
+                    return mainBuilding
+                        ? buildingCardHtml(mainBuilding, { ...sourceSite, team: site.team })
+                        : "";
+                }, { maxWidth: 360 });
+            }
+            marker.on("click", event =>
+                selectDepotRoutes(site, position, event)
+            );
+            // Keep the objective marker usable at detail zoom: when a depot
+            // building card is available, open it explicitly alongside the
+            // route selection instead of relying on Leaflet's default marker
+            // click handler (which can be intercepted by the route logic).
+            marker.on("click", () => {
+                if (marker.getPopup()) marker.openPopup();
+            });
+        }
+
+        if (categoryGroup?.capture) {
+            L.circle(position, {
+                radius: worldRadiusToMapRadius(site.capture_radius),
+                color: teamColor(site.team),
+                fillColor: teamColor(site.team),
+                fillOpacity: 0.035,
+                weight: 1,
+                dashArray: "4, 4"
+            }).bindTooltip(tooltip).addTo(categoryGroup.capture);
+        }
+    }
+
+    function drawMobileFireUnit(unit) {
+        const color = teamColor(unit.team);
+        const isMlrs = unit.unit_type === "mlrs";
+        const strategicGroups =
+            (missionGroups[unit.team] || missionGroups[1]).strategic;
+        const spawnGroup = isMlrs
+            ? strategicGroups.mlrsSpawn
+            : strategicGroups.tbmSpawn;
+        const moveGroup = isMlrs
+            ? strategicGroups.mlrsMove
+            : strategicGroups.tbmMove;
+        const typeLabel = isMlrs ? "MLRS" : "TBM";
+
+        if (unit.spawn_area) {
+            const [x, , z] = unit.spawn_area.center;
+            L.circle(worldToLatLng(x, z), {
+                radius: worldRadiusToMapRadius(unit.spawn_area.radius),
+                color,
+                fillColor: color,
+                fillOpacity: 0.08,
+                weight: 2
+            }).bindTooltip(`
+                <b>${escapeHtml(unit.name)}</b><br>
+                ${typeLabel} randomized spawn area<br>
+                Radius: ${Number(unit.spawn_area.radius).toFixed(0)} m
+            `).addTo(spawnGroup);
+            L.marker(worldToLatLng(x, z), {
+                icon: natoIcon(unit.team, isMlrs ? "mlrs" : "tbm", 30)
+            }).bindTooltip(`
+                <b>${escapeHtml(unit.name)}</b><br>
+                Representative marker at randomized spawn-area centre
+            `).addTo(spawnGroup);
+        }
+
+        unit.move_areas.forEach((area, index) => {
+            const [x, , z] = area.center;
+            const position = worldToLatLng(x, z);
+            L.circle(position, {
+                radius: worldRadiusToMapRadius(area.radius),
+                color,
+                fillColor: color,
+                fillOpacity: 0.035,
+                weight: 1.5,
+                dashArray: "6, 5"
+            }).bindTooltip(`
+                <b>${escapeHtml(unit.name)}</b><br>
+                ${typeLabel} relocation destination ${index + 1}<br>
+                AI drives to the centre · ${Number(area.radius).toFixed(0)} m editor area
+            `).addTo(moveGroup);
+            L.circleMarker(position, {
+                radius: 3,
+                color,
+                fillColor: color,
+                fillOpacity: 1,
+                weight: 1
+            }).addTo(moveGroup);
+        });
+    }
+
+    function routeNetworkLabel(route) {
+        if (route?.source === "navigation mesh") {
+            return "Fallback route through the extracted navigation mesh; endpoint connectors may be off-mesh";
+        }
+        if (route?.source === "direct fallback") {
+            return "No connected extracted route; showing a straight-line preview";
+        }
+        return "Routed through extracted vehicle roads; short endpoint connectors may be off-road";
+    }
+
+    function drawMissionLogic(logic) {
+        // Standard and swapped missions each carry authored coordinates, so
+        // the selected variant's records are drawn as they are.
+        logic.sites.forEach(drawLogicSite);
+        logic.mobile_fire_units.forEach(drawMobileFireUnit);
+
+        logic.likely_convoy_links.forEach(link => {
+            // Fuel is orange; ammunition is green.  Keep these distinct from
+            // team colors so logistics routes remain readable when both are
+            // selected together.
+            const color = link.resource === "fuel" ? "#f6ad55" : "#68d391";
+            const route = convoyRoute(link);
+            drawSelectableRoute({
+                key: convoyRouteKey(link),
+                endpoints: [link.factory, link.assembly],
+                route,
+                color,
+                dashArray: "5, 6",
+                tooltip: `
+                <b>Possible ${escapeHtml(link.resource)} convoy</b><br>
+                ${escapeHtml(link.factory)} → ${escapeHtml(link.assembly)}<br>
+                Selection distance: ${formatDistance(link.distance)} · rank ${link.rank_by_distance}<br>
+                Approximate route: ${formatDistance(route.distance)}<br>
+                ${routeNetworkLabel(route)}<br>
+                The game sends each column to whichever of the 3 nearest non-full storages has the most free capacity<br>
+                <i>Click to keep this route highlighted</i>
+                `,
+                group: (missionGroups[link.team] || missionGroups[1])
+                    .fuelAmmoDepots.convoy
+            });
+        });
+
+        (logic.likely_armored_links || []).forEach(link => {
+            const route = armoredRoute(link);
+            drawSelectableRoute({
+                key: armoredRouteKey(link),
+                endpoints: [link.assembly, link.target],
+                route,
+                color: teamColor(link.team),
+                dashArray: "11, 5",
+                baseWeight: 2.25,
+                baseOpacity: 0.78,
+                tooltip: `
+                <b>Likely initial armored-column route</b><br>
+                ${escapeHtml(link.assembly)} → ${escapeHtml(link.target)}<br>
+                Target: ${escapeHtml(displayName(link.target_category))} · nearest rank ${link.rank_by_distance}<br>
+                Direct selection distance: ${formatDistance(link.distance)}<br>
+                Approximate route: ${formatDistance(route.distance)}<br>
+                ${routeNetworkLabel(route)}<br>
+                The game randomly chooses among the three nearest eligible targets
+                (enemy depots, strongpoints and airfields); ownership and
+                surviving defenders can change eligibility<br>
+                <i>Click to keep this route highlighted</i>
+                `,
+                group: (missionGroups[link.team] || missionGroups[1])
+                    .vehicleDepots.armored
+            });
+        });
+
+        logic.mlrs_tbm_targets.forEach(target => {
+            const [x, , z] = target.world_pos;
+            const position = worldToLatLng(x, z);
+            const tooltip = `
+                <b>${escapeHtml(target.name)}</b><br>
+                Eligible enemy target for MLRS/TBM · ${escapeHtml(displayName(target.category))}
+            `;
+
+            // Eligible targets share their coordinates with the normal objective
+            // markers. Draw a high-contrast screen-sized ring in a dedicated pane
+            // so switching this overlay on always produces a visible change.
+            L.circleMarker(position, {
+                pane: "strategicTargets",
+                radius: 13,
+                color: "#f6e05e",
+                fill: false,
+                weight: 3,
+                opacity: 1,
+                dashArray: "3, 3"
+            }).bindTooltip(tooltip).addTo(
+                (missionGroups[target.team === 1 ? 2 : 1] || missionGroups[1])
+                    .strategic.targets
+            );
+
+            L.marker(position, {
+                pane: "strategicTargets",
+                icon: natoIcon(target.team, "tank_radar_target", 18),
+                zIndexOffset: 1000
+            }).bindTooltip(tooltip).addTo(
+                (missionGroups[target.team === 1 ? 2 : 1] || missionGroups[1])
+                    .strategic.targets
+            );
+        });
+
+        (logic.bomber_spawns || []).forEach(spawn => {
+            const [x, , z] = spawn.world_pos;
+            L.marker(worldToLatLng(x, z), {
+                icon: bomberIcon(spawn.team)
+            }).bindTooltip(`
+                <b>${escapeHtml(spawn.name)}</b><br>
+                ${spawn.team === 1 ? "Tu-95M" : "B-52H"} strategic-bomber spawn
+            `).addTo(
+                (missionGroups[spawn.team] || missionGroups[1]).strategic.bombers
+            );
+        });
+    }
+
+    function lifecycleForUnit(unit, site) {
+        const rules = globalMissionLogic?.respawn_rules || [];
+        const objectId = String(unit.id || "").toLowerCase();
+        const unitName = String(unit.name || "").toLowerCase();
+        const siteName = String(site?.name || "").toLowerCase();
+        const missionRule = rules.find(rule => {
+            const object = String(rule.object || "").toLowerCase();
+            if (!object) return false;
+            if (object === objectId || object === unitName) return true;
+            // The mission trigger uses one squad object for all of the
+            // individual long-range radar sites. Map data contains the
+            // concrete site names (for example t1_longrange_radar_01), so
+            // join that shared trigger to each radar unit here.
+            return object.endsWith("_longrange_radar_squad") &&
+                siteName.startsWith(object.replace(/_squad$/, "_"));
+        });
+        if (missionRule) {
+            return {
+                kind: String(missionRule.mode || "respawn"),
+                seconds: Number(missionRule.seconds),
+                source: "mission"
+            };
+        }
+
+        const lifecycle = unit.lifecycle || {};
+        const kind = String(lifecycle.kind || "none");
+        const restoreSeconds = Number(globalMissionLogic?.template_restore?.restore_seconds);
+        const depotSeconds = Number(globalMissionLogic?.template_restore?.depot_repair_seconds);
+        if (kind === "restore") {
+            return { kind, seconds: restoreSeconds, source: "template" };
+        }
+        if (kind === "repair_with_site") {
+            return { kind, seconds: depotSeconds, source: "template" };
+        }
+        return { kind, seconds: null, source: lifecycle.source || "unknown" };
+    }
+
+    // Label a weapon's maximum range by what it fires. Guided weapons are
+    // missiles; unguided launchers (MLRS) are rockets; cannons and machine
+    // guns are guns. unit_specs.json exposes guidance and the weapon name.
+    function weaponRangeKind(weapon) {
+        const name = String(weapon?.name || "").toLowerCase();
+        if (weapon?.guidance) return "Missile";
+        if (/rocket|missile/.test(name)) return "Rocket";
+        if (/cannon|machinegun|gun/.test(name)) return "Gun";
+        return "Weapon";
+    }
+
+    function longestRangeWeapon(weapons) {
+        return (weapons || []).reduce((best, weapon) => {
+            const range = Number(weapon?.effective_maximum || 0);
+            const bestRange = Number(best?.effective_maximum || 0);
+            return !best || range > bestRange ||
+                (range === bestRange && weapon?.guidance && !best.guidance)
+                ? weapon
+                : best;
+        }, null);
+    }
+
+    function unitCardHtml(unit, site, count = 1) {
+        const name = String(unit.name || "unit");
+        const role = String(unit.role || "vehicle");
+        const lifecycle = lifecycleForUnit(unit, site);
+        // Depot repair is mission behavior, not an icon role: missile-based
+        // defenders can use a SAM symbol while still repairing with the depot.
+        const repairsWithDepot = lifecycle.kind === "repair_with_site";
+        const specs = globalUnitSpecs[name.toLowerCase()];
+        const icon = natoIconPath(site.team, unitIconType(unit, site));
+        const vehicleImage = vehicleImageSources(name);
+        const cardWeapons = (specs?.weapons || []).slice(0, 2);
+        const displayedEngagement = displayEngagementRange(unit, specs);
+        const sensor = specs?.sensors || {};
+        const statEntries = [];
+        function addSensorStat(label, sensorData) {
+            if (sensorData?.nominal) {
+                statEntries.push([label, formatDistance(sensorData.nominal)]);
+            }
+            const bands = Array.isArray(sensorData?.band) ? sensorData.band : [sensorData?.band];
+            if (bands.some(band => Number.isFinite(Number(band)) && Number(band) >= 0)) {
+                statEntries.push([`${label} band`, natoRadarBand(sensorData.band)]);
+            }
+        }
+        addSensorStat("Detection", sensor.detection);
+        addSensorStat("Tracking", sensor.tracking);
+        addSensorStat("IRST", sensor.irst);
+        if (specs?.sensors?.detection?.designation_range) {
+            statEntries.push([
+                "Designation",
+                formatDistance(specs.sensors.detection.designation_range)
+            ]);
+        }
+        const physicalMissileMax = Number(specs?.engagement_range || 0);
+        if (displayedEngagement > 0) {
+            statEntries.push(["Engagement", formatDistance(displayedEngagement)]);
+            if (physicalMissileMax > displayedEngagement) {
+                const kind = weaponRangeKind(longestRangeWeapon(specs?.weapons));
+                statEntries.push([`${kind} max`, formatDistance(physicalMissileMax)]);
+            }
+        } else if (unit.threat_range) {
+            statEntries.push(["Threat range", formatDistance(unit.threat_range)]);
+        }
+        const timerSeconds = Number(lifecycle.seconds);
+        const noRespawn = lifecycle.kind === "none";
+        const depotTimerSeconds = repairsWithDepot && timerSeconds > 0 ? timerSeconds : null;
+        if (specs?.target_channels) {
+            statEntries.push(["Channels", specs.target_channels]);
+        }
+        const staticGroundPosition = site.source_group !== "ships" &&
+            operationalCategory(site) !== "strategic";
+        if (specs?.maximum_speed_kph && !staticGroundPosition) {
+            statEntries.push(["Road speed", `${specs.maximum_speed_kph} km/h`]);
+        }
+        const statHtml = statEntries.length
+            ? `<div class="vehicle-card-stats">${statEntries.map(([label, value]) => `
+                <span class="vehicle-card-stat">${escapeHtml(label)}<b>${escapeHtml(value)}</b></span>
+            `).join("")}</div>`
+            : "";
+        const weaponLines = cardWeapons.map(weapon => {
+            const range = Number(weapon.effective_maximum || 0);
+            const ammoValue = Number(weapon.ammo);
+            const ammo = weapon.ammo !== null && weapon.ammo !== undefined &&
+                Number.isFinite(ammoValue) && ammoValue >= 0
+                ? ` · ammo ${ammoValue}`
+                : "";
+            const reload = weapon.reload_seconds
+                ? ` · reload ${formatSeconds(weapon.reload_seconds)}`
+                : "";
+            const rangeLabel = range
+                ? (physicalMissileMax > displayedEngagement &&
+                    /_sam_launcher_|_tbm_|_mlrs_/.test(name.toLowerCase())
+                    ? ` ${weaponRangeKind(weapon).toLowerCase()} max ${formatDistance(range)}`
+                    : ` ${formatDistance(range)}`)
+                : "";
+            return `<strong>${escapeHtml(displayName(weapon.name))}</strong>` +
+                rangeLabel + ammo + reload;
+        });
+        const weaponHtml = weaponLines.length
+            ? `<p class="vehicle-card-weapons">${weaponLines.join("<br>")}</p>`
+            : "";
+        const artHtml = vehicleImage.src || vehicleImage.missing
+            ? `<div class="vehicle-card-art-wrap${vehicleImage.src ? "" : " no-art"}">
+                ${vehicleImage.src ? `<img class="vehicle-card-art" src="${escapeHtml(vehicleImage.src)}" alt=""
+                    data-fallbacks="${escapeHtml(vehicleImage.fallbacks.join("|"))}"
+                    onerror="handleImageError(this, 'remove')">` : ""}
+                ${repairsWithDepot
+                    ? `<span class="vehicle-card-depot-context"><img src="images/icons/respawnbase_timer_ui.svg" alt=""><span>With depot</span>${depotTimerSeconds > 0 ? `<b>${escapeHtml(formatSeconds(depotTimerSeconds))}</b>` : ""}</span>`
+                    : (timerSeconds > 0
+                    ? `<span class="vehicle-card-timer"><img src="images/icons/respawnbase_timer_ui.svg" alt="">${escapeHtml(formatSeconds(timerSeconds))}</span>`
+                    : (noRespawn ? `<span class="vehicle-card-timer no-respawn"><img src="images/icons/respawnbase_timer_ui.svg" alt="">NO</span>` : ""))}
+                ${count > 1 ? `<span class="vehicle-card-count">×${count}</span>` : ""}
+            </div>`
+            : "";
+        const headerCount = !vehicleImage.src && !vehicleImage.missing && count > 1
+            ? `<span class="vehicle-card-count">×${count}</span>`
+            : "";
+        return `
+            <article class="vehicle-card team-${escapeHtml(site.team)}">
+                <div class="vehicle-card-header">
+                    <img class="vehicle-card-icon" src="${escapeHtml(icon)}" alt="">
+                    <span>${escapeHtml(displayName(name))}</span>
+                    ${headerCount}
+                </div>
+                ${artHtml}
+                <div class="vehicle-card-role">${escapeHtml(displayName(role))}</div>
+                ${statHtml}
+                ${weaponHtml}
+            </article>
+        `;
+    }
+
+    const BUILDING_CARD_DATA = {
+        nt_fuel_factory: {
+            label: "Fuel factory",
+            hp: 4000,
+            icon: "fuel_storage",
+            art: "images/portraits/bombtarget_oil_storage_07_a.png"
+        },
+        nt_ammo_factory: {
+            label: "Ammunition factory",
+            hp: 5000,
+            icon: "ammo_storage",
+            art: "images/portraits/assembly_area_ammo_storage_a.png"
+        },
+        nt_assembly_area_fuel_storage: {
+            label: "Assembly fuel storage",
+            hp: 4000,
+            icon: "fuel_storage",
+            art: "images/portraits/bombtarget_oil_storage_08_a.png"
+        },
+        nt_assembly_area_ammo_storage: {
+            label: "Assembly ammunition storage",
+            hp: 5000,
+            icon: "ammo_storage",
+            art: "images/portraits/assembly_area_ammo_storage_a.png"
+        },
+        nt_assembly_area_tank_factory: {
+            label: "Assembly tank factory",
+            hp: 6000,
+            icon: "tank_storage",
+            art: "images/portraits/bombtarget_tank_garage_building_01_a.png"
+        }
+    };
+
+    function compactSiteBuildings(buildings) {
+        const grouped = new Map();
+        buildings.forEach(building => {
+            const key = String(building.name || "building");
+            const entry = grouped.get(key) || { building, count: 0 };
+            entry.count += 1;
+            grouped.set(key, entry);
+        });
+        return [...grouped.values()].sort((a, b) =>
+            displayName(a.building.name).localeCompare(displayName(b.building.name))
+        );
+    }
+
+    function buildingCardHtml(building, site, count = 1) {
+        const key = String(building.name || "").toLowerCase();
+        const data = BUILDING_CARD_DATA[key];
+        if (!data) return "";
+        // Depot structures use the resource-factory repair rule extracted
+        // from the selected mission/templates. Do not invent a UI fallback.
+        const repairSeconds = Number(
+            globalMissionLogic?.rules?.resource_factory?.repair_seconds ||
+            globalMissionLogic?.template_restore?.depot_repair_seconds
+        );
+        const art = usableImageSources([data.art])[0];
+        return `
+            <article class="vehicle-card team-${escapeHtml(site.team)} building-card">
+                <div class="vehicle-card-header">
+                    <img class="vehicle-card-icon" src="${escapeHtml(natoIconPath(site.team, data.icon))}" alt="">
+                    <span>${escapeHtml(data.label)}</span>
+                    ${count > 1 ? `<span class="vehicle-card-count">×${count}</span>` : ""}
+                </div>
+                <div class="vehicle-card-art-wrap${art ? "" : " no-art"}">
+                    ${art ? `<img class="vehicle-card-art" src="${escapeHtml(art)}" alt="" onerror="handleImageError(this, 'remove')">` : ""}
+                    ${repairSeconds > 0 ? `<span class="vehicle-card-timer"><img src="images/icons/respawnbase_timer_ui.svg" alt="">${escapeHtml(formatSeconds(repairSeconds))}</span>` : ""}
+                </div>
+                <div class="vehicle-card-role">Structure · ${escapeHtml(site.name)}</div>
+                <div class="vehicle-card-stats">
+                    <span class="vehicle-card-stat">Integrity<b>${data.hp.toLocaleString()} HP</b></span>
+                </div>
+            </article>
+        `;
+    }
+
+    function airfieldCardHtml(site) {
+        const isMain = /_airfield_main$/.test(String(site.name || ""));
+        const rule = globalMissionLogic?.airfield_rules?.[site.name];
+        const hp = Number(rule?.hp || (isMain ? 20000000 : 500000));
+        const units = compactSiteUnits(site.units_by_era?.[selectedPresetId()] || []);
+        return `
+            <section class="airfield-popup team-${escapeHtml(site.team)}">
+                <h2 class="site-popup-title">${isMain ? "Main airfield" : "Front airfield"}</h2>
+                <p class="airfield-popup-meta">${escapeHtml(site.name)} · ${hp.toLocaleString()} HP</p>
+                <h3>Airfield defence</h3>
+                <ul class="airfield-popup-composition">
+                    ${units.length
+                        ? units.map(({ unit, count }) => `<li>${count > 1 ? `${count}× ` : ""}${escapeHtml(displayName(unit.name))}</li>`).join("")
+                        : "<li>No airfield defence layout is extracted.</li>"}
+                </ul>
+            </section>
+        `;
+    }
+
+    function compositionSiteLabel(site, siteCount = 1) {
+        const category = operationalCategory(site);
+        const prefix = site.team === 1 ? "REDFOR" : "BLUFOR";
+        const number = String(site.name || "").match(/_(\d+)$/)?.[1];
+        const type = {
+            shortSams: "close SAM site",
+            longSams: "long-range SAM site",
+            ewRadars: "early-warning radar",
+            airfields: "airfield",
+            strategic: "strategic launch unit",
+            fleet: "fleet patrol group",
+            vehicleDepots: "vehicle depot",
+            fuelAmmoDepots: "fuel/ammunition depot",
+            strongpoints: "strongpoint"
+        }[category] || "ground site";
+        if (siteCount > 1) return `${prefix} ${type} ×${siteCount}`;
+        return `${prefix} ${type}${number ? ` ${number}` : ""}`;
+    }
+
+    function compactSiteUnits(units) {
+        const grouped = new Map();
+        units.forEach(unit => {
+            const key = [unit.name, unit.role, unit.preset].join("|");
+            const entry = grouped.get(key) || { unit, count: 0 };
+            entry.count += 1;
+            grouped.set(key, entry);
+        });
+        return [...grouped.values()].sort((a, b) =>
+            displayName(a.unit.name).localeCompare(displayName(b.unit.name))
+        );
+    }
+
+    function siteOverviewIcon(team, category, context = null) {
+        if (category === "airfields") {
+            const runways = Array.isArray(context?.runways) ? context.runways : [];
+            const runway = runways.reduce((longest, candidate) => {
+                const [sx, , sz] = candidate.start || [];
+                const [ex, , ez] = candidate.end || [];
+                const length = Math.hypot(Number(ex) - Number(sx), Number(ez) - Number(sz));
+                return !longest || length > longest.length ? { candidate, length } : longest;
+            }, null)?.candidate;
+            const [sx, , sz] = runway?.start || [];
+            const [ex, , ez] = runway?.end || [];
+            // Leaflet's simple CRS renders larger latitude values upward on
+            // screen, while CSS rotation uses a downward-growing y axis.
+            // Negate the world-space angle so the marker's long edge follows
+            // the runway visually instead of mirroring it vertically.
+            const angle = runway
+                ? -Math.atan2(Number(ez) - Number(sz), Number(ex) - Number(sx)) * 180 / Math.PI
+                : 0;
+            return L.divIcon({
+                className: "",
+                html: `<span class="airfield-overview-icon team-${team}" style="transform:rotate(${angle.toFixed(2)}deg)" aria-label="${team === 1 ? "REDFOR" : "BLUFOR"} airfield"></span>`,
+                iconSize: [38, 12],
+                iconAnchor: [19, 6],
+                tooltipAnchor: [0, -14]
+            });
+        }
+        const type = {
+            strongpoints: "tank",
+            vehicleDepots: "tank_storage",
+            fuelAmmoDepots: "fuel_storage",
+            shortSams: "sam",
+            longSams: "sam",
+            ewRadars: "radar_station",
+            strategic: "tbm"
+        }[category] || "tank";
+        const classes = ["site-overview-icon", `team-${team}`];
+        const samSite = category === "shortSams" || category === "longSams";
+        if (samSite) classes.push("sam-site");
+        if (category === "longSams") classes.push("long-range");
+        const family = activeIconFamily();
+        const renderSize = iconRenderSize(30);
+        const content = `<img data-icon-family="${family}" data-icon-size="${renderSize}" style="width:${renderSize}px;height:${renderSize}px" src="${escapeHtml(natoIconPath(team, type, { colorRole: samSite ? "sam-site" : "default" }))}" alt="">`;
+        return L.divIcon({
+            className: "",
+            html: `<span class="${classes.join(" ")}">${content}</span>`,
+            iconSize: [36, 36],
+            iconAnchor: [18, 18],
+            tooltipAnchor: [0, -20]
+        });
+    }
+
+    function siteLegendIcon(team, category) {
+        const family = activeIconFamily();
+        const renderSize = iconRenderSize(30);
+        if (category === "resourceConvoys") {
+            return `<span class="site-overview-icon team-${team}"><img data-icon-family="${family}" data-icon-size="${renderSize}" style="width:${renderSize}px;height:${renderSize}px" src="${escapeHtml(natoIconPath(team, "truck"))}" alt=""></span>`;
+        }
+        if (category === "armoredColumns") {
+            return `<span class="site-overview-icon team-${team}"><img data-icon-family="${family}" data-icon-size="${renderSize}" style="width:${renderSize}px;height:${renderSize}px" src="${escapeHtml(natoIconPath(team, "tank"))}" alt=""></span>`;
+        }
+        return siteOverviewIcon(team, category).options.html;
+    }
+
+    function convoyEraKey(presetId) {
+        // Preset labels are generated from the active mission templates
+        // (build_map_data.py), so they name the same era as the convoy
+        // templates without hard-coding rank boundaries here.
+        const label = presetDisplayName(presetId).toLowerCase();
+        if (label.includes("1970") && label.includes("early")) return "1970_early";
+        if (label.includes("1970") && label.includes("late")) return "1970_late";
+        if (label.includes("1980")) return "1980";
+        if (label.includes("2018")) return "2018";
+        return null;
+    }
+
+    function convoyEntrySummary(entries) {
+        return (entries || []).map(entry =>
+            `${entry.count > 1 ? `${entry.count}× ` : ""}${displayName(entry.name)}`
+        ).join(" · ");
+    }
+
+    function convoyLegendHtml(category) {
+        const era = convoyEraKey(selectedPresetId());
+        const convoys = globalMissionLogic?.convoys || {};
+        const convoyCards = (entries, team, label) => {
+            const list = Array.isArray(entries) ? entries : [];
+            const site = {
+                name: `convoy_${label.toLowerCase().replaceAll(" ", "_")}`,
+                team,
+                source_group: "convoys",
+                category: "convoy"
+            };
+            return `
+                <details class="composition-site team-${team}" open>
+                    <summary>${escapeHtml(label)}</summary>
+                    <div class="vehicle-card-grid">
+                        ${list.length
+                            ? list.map(entry => unitCardHtml({
+                                name: entry.name,
+                                role: entry.role || "vehicle",
+                                count: entry.count
+                            }, site, Number(entry.count || 1))).join("")
+                            : `<p class="composition-site-description">No units listed.</p>`}
+                    </div>
+                </details>
+            `;
+        };
+        if (category === "resourceConvoys") {
+            const resourceByEra = convoys.resource || {};
+            const resource = era ? resourceByEra[era] : null;
+            if (!resource) return "<p>Convoy composition is not available for this preset.</p>";
+            const side = legendTeam === 1 ? "redfor" : "blufor";
+            const sideLabel = legendTeam === 1 ? "REDFOR" : "BLUFOR";
+            return convoyCards(resource.fuel?.[side], legendTeam, `Fuel convoy · ${sideLabel}`) +
+                convoyCards(resource.ammo?.[side], legendTeam, `Ammunition convoy · ${sideLabel}`);
+        }
+        const armoredByEra = convoys.armored || {};
+        const armored = era ? armoredByEra[era] : null;
+        if (!armored) return "<p>Armoured-column composition is not available for this preset.</p>";
+        const side = legendTeam === 1 ? "redfor" : "blufor";
+        const sideLabel = legendTeam === 1 ? "REDFOR" : "BLUFOR";
+        return `<p class="composition-site-description"><b>SPG variant probability:</b> ${Math.round(Number(armored.spg_probability || 0) * 100)}%</p>` +
+            convoyCards(armored.standard?.[side], legendTeam, `Standard column · ${sideLabel}`) +
+            convoyCards(armored.spg?.[side], legendTeam, `SPG column · ${sideLabel}`);
+    }
+
+    function respawnLegendHtml() {
+        const rules = globalMissionLogic?.respawn_rules || [];
+        const grouped = new Map();
+        rules.forEach(rule => {
+            const key = `${rule.system}|${rule.seconds}|${rule.mode}`;
+            const entry = grouped.get(key) || { rule, count: 0 };
+            entry.count += 1;
+            grouped.set(key, entry);
+        });
+        const fixed = [...grouped.values()].map(({ rule, count }) =>
+            `<p><b>${escapeHtml(rule.system)}:</b> ${escapeHtml(formatSeconds(rule.seconds))} ${rule.mode === "restore" ? "restore" : "respawn"}${count > 1 ? ` (${count} units)` : ""}</p>`
+        ).join("");
+        const noFixed = globalMissionLogic?.no_fixed_respawn || [
+            "Static SAM/AA sites",
+            "Strongpoints and depot buildings",
+            "Airfields",
+            "Ships",
+            "Dynamically produced convoys and columns"
+        ];
+        const templateRestoreSeconds = Number(globalMissionLogic?.template_restore?.restore_seconds);
+        const templateLine = templateRestoreSeconds > 0
+            ? `<p><b>Template restoration:</b> ${escapeHtml(formatSeconds(templateRestoreSeconds))}.</p>`
+            : "";
+        const depotSeconds = Number(
+            globalMissionLogic?.template_restore?.depot_repair_seconds
+        );
+        const depotLine = depotSeconds > 0
+            ? `<p><b>Depot restore:</b> ${escapeHtml(formatSeconds(depotSeconds))} after damage/repair timer.</p>`
+            : "";
+        return fixed + templateLine + depotLine +
+            `<p><b>No fixed timer:</b> ${escapeHtml(noFixed.join("; "))}.</p>`;
+    }
+
+    function overviewSiteLabel(entry) {
+        const category = operationalCategory(entry.site);
+        const prefix = entry.site.team === 1 ? "REDFOR" : "BLUFOR";
+        const type = {
+            shortSams: "close SAM site",
+            longSams: "long-range SAM site",
+            ewRadars: "early-warning radar",
+            airfields: "airfield",
+            strategic: "strategic launch unit",
+            vehicleDepots: "vehicle depot",
+            fuelAmmoDepots: "fuel/ammunition depot",
+            strongpoints: "strongpoint"
+        }[category] || "ground site";
+        return `${prefix} ${type}${entry.siteCount > 1 ? ` ×${entry.siteCount}` : ""}`;
+    }
+
+    function overviewSiteRecords(selectedEra) {
+        const records = globalSiteData.map(site => {
+            return {
+                site,
+                units: (site.units_by_era?.[selectedEra] || []).map(unit => ({
+                    ...unit,
+                    _originSiteName: site.name
+                })),
+                buildings: [...(site.buildings_by_era?.[selectedEra] || [])],
+                siteNames: [site.name],
+                relatedSites: [site],
+                siteCount: 1
+            };
+        }).filter(record =>
+            record.units.length || record.buildings.length ||
+            ["airfields", "vehicleDepots", "fuelAmmoDepots"].includes(
+                operationalCategory(record.site)
+            )
+        );
+
+        const centralSites = records.filter(record =>
+            /_(short|long)_sam_site_\d+$/.test(String(record.site.name || ""))
+        );
+        const absorbed = new Set();
+        records.forEach(record => {
+            if (!/_(sam|spaa)_cover_foundation_\d+$/.test(String(record.site.name || ""))) return;
+            const [x, , z] = record.site.world_pos;
+            let closest = null;
+            let closestDistance = Infinity;
+            centralSites.forEach(candidate => {
+                if (candidate.site.team !== record.site.team) return;
+                const [candidateX, , candidateZ] = candidate.site.world_pos;
+                const distance = Math.hypot(x - candidateX, z - candidateZ);
+                if (distance < closestDistance) {
+                    closest = candidate;
+                    closestDistance = distance;
+                }
+            });
+            if (closest && closestDistance <= 2000) {
+                closest.units.push(...record.units);
+                closest.buildings.push(...record.buildings);
+                closest.siteNames.push(record.site.name);
+                closest.relatedSites.push(record.site);
+                absorbed.add(record);
+            }
+        });
+        return records.filter(record =>
+            !absorbed.has(record) && operationalCategory(record.site) !== "fleet"
+        );
+    }
+
+    function overviewUnitSummary(entry) {
+        const units = compactSiteUnits(entry.units);
+        const unitText = units.map(({ unit, count }) =>
+            `${count}× ${displayName(unit.name)}`
+        );
+        const buildingText = compactSiteBuildings(entry.buildings).map(({ building, count }) =>
+            `${count}× ${displayName(building.name)}`
+        );
+        return [...unitText, ...buildingText].slice(0, 8);
+    }
+
+    function siteCardHtml(entry) {
+        const unitCards = compactSiteUnits(entry.units).map(({ unit, count }) =>
+            unitCardHtml(unit, entry.site, count)
+        );
+        const buildingCards = compactSiteBuildings(entry.buildings).map(({ building, count }) =>
+            buildingCardHtml(building, entry.site, count)
+        );
+        const objectiveCards = operationalCategory(entry.site) === "airfields"
+            ? [airfieldCardHtml(entry.site)]
+            : [];
+        return [...unitCards, ...buildingCards, ...objectiveCards].join("");
+    }
+
+    function sitePopupHtml(entry) {
+        const units = compactSiteUnits(entry.units || []);
+        const buildings = compactSiteBuildings(entry.buildings || []);
+        const unitButtons = units.map(({ unit, count }, index) => {
+            const name = String(unit.name || "unit");
+            const specs = globalUnitSpecs[name.toLowerCase()];
+            const hoverIcon = natoIconPath(entry.site.team, unitIconType(unit, entry.site));
+            const image = fallbackImageHtml([
+                ...slotArtUrls(name, specs?.model),
+                hoverIcon
+            ], "site-popup-unit-image");
+            return `<button type="button" class="site-popup-unit"
+                data-popup-unit-index="${index}"
+                title="${escapeHtml(displayName(name))}">
+                ${image}
+                <span class="site-popup-unit-label">${escapeHtml(displayName(name))}</span>
+                ${count > 1 ? `<span class="site-popup-unit-count">×${count}</span>` : ""}
+            </button>`;
+        }).join("");
+        const buildingButtons = buildings.map(({ building, count }, index) => {
+            const data = BUILDING_CARD_DATA[String(building.name || "").toLowerCase()];
+            if (!data) return "";
+            return `<button type="button" class="site-popup-unit"
+                data-popup-building-index="${index}"
+                title="${escapeHtml(data.label)}">
+                <img class="site-popup-unit-image" src="${escapeHtml(natoIconPath(entry.site.team, data.icon))}" alt="">
+                <span class="site-popup-unit-label">${escapeHtml(data.label)}</span>
+                ${count > 1 ? `<span class="site-popup-unit-count">×${count}</span>` : ""}
+            </button>`;
+        }).join("");
+        const totalTypes = units.length + buildings.filter(({ building }) =>
+            BUILDING_CARD_DATA[String(building.name || "").toLowerCase()]
+        ).length;
+        return `
+            <h2 class="site-popup-title">${escapeHtml(overviewSiteLabel(entry))}</h2>
+            ${totalTypes
+                ? `<div class="site-popup-unit-grid" style="--site-popup-items:${totalTypes}">${unitButtons}${buildingButtons}</div>`
+                : ""}
+        `;
+    }
+
+    function sitePopupDetailHtml(entry, record, kind) {
+        const card = kind === "building"
+            ? buildingCardHtml(record.building, entry.site, record.count)
+            : unitCardHtml(record.unit, entry.site, record.count);
+        return `
+            <button type="button" class="site-popup-back" data-popup-back>← Site overview</button>
+            <h2 class="site-popup-title">${escapeHtml(overviewSiteLabel(entry))}</h2>
+            <div class="vehicle-card-grid">${card}</div>
+        `;
+    }
+
+    function bindSitePopupButtons(content, entry) {
+        if (!content) return;
+        const units = compactSiteUnits(entry.units || []);
+        const buildings = compactSiteBuildings(entry.buildings || []);
+        content.querySelectorAll("[data-popup-unit-index]").forEach(button => {
+            button.addEventListener("click", event => {
+                event.stopPropagation();
+                const record = units[Number(button.dataset.popupUnitIndex)];
+                if (!record) return;
+                content.innerHTML = sitePopupDetailHtml(entry, record, "unit");
+                bindSitePopupButtons(content, entry);
+            });
+        });
+        content.querySelectorAll("[data-popup-building-index]").forEach(button => {
+            button.addEventListener("click", event => {
+                event.stopPropagation();
+                const record = buildings[Number(button.dataset.popupBuildingIndex)];
+                if (!record) return;
+                content.innerHTML = sitePopupDetailHtml(entry, record, "building");
+                bindSitePopupButtons(content, entry);
+            });
+        });
+        content.querySelector("[data-popup-back]")?.addEventListener("click", event => {
+            event.stopPropagation();
+            content.innerHTML = sitePopupHtml(entry);
+            bindSitePopupButtons(content, entry);
+        });
+    }
+
+    function clearFocusedSite({ keepRoutes = false, keepDetails = false } = {}) {
+        clearSamSiteRanges();
+        if (focusedOverviewMarker && focusedOverviewSite) {
+            const category = operationalCategory(focusedOverviewSite.site);
+            focusedDetailGroup.removeLayer(focusedOverviewMarker);
+            const overviewGroup =
+                (siteGroups[focusedOverviewSite.site.team] || siteGroups[1])[category];
+            if (layerIsEnabled(overviewGroup)) {
+                overviewGroup.addLayer(focusedOverviewMarker);
+            }
+        }
+        focusedOverviewMarker = null;
+        focusedOverviewSite = null;
+        highlightedRunwaySite = null;
+        focusedOverviewExpanded = false;
+        focusedOverviewSelections.clear();
+        if (!keepDetails) focusedDetailGroup.clearLayers();
+        if (!keepRoutes) clearAutoRouteGroups();
+        map.closePopup();
+        refreshAirfieldRunwayStyles();
+    }
+
+    function highlightAirfieldRunway(siteName) {
+        const entry = latestOverviewEntries.find(candidate =>
+            candidate.site.name === siteName && operationalCategory(candidate.site) === "airfields"
+        );
+        if (!entry) return;
+        highlightedRunwaySite = siteName;
+        refreshAirfieldRunwayStyles();
+    }
+
+    function refreshAirfieldRunwayStyles() {
+        const overviewZoom = map.getZoom() < DETAIL_ZOOM;
+        latestOverviewEntries
+            .filter(entry => operationalCategory(entry.site) === "airfields")
+            .forEach(entry => {
+                const focused = focusedOverviewSite?.site.name === entry.site.name ||
+                    highlightedRunwaySite === entry.site.name;
+                const siteLayer = siteGroups[entry.site.team]?.airfields;
+                const layerVisible = !siteLayer || layerIsEnabled(siteLayer);
+                const highlighted = layerVisible && (focused || (
+                    legendCategory === "airfields" && entry.site.team === legendTeam
+                ));
+                const baseColor = teamColor(entry.site.team);
+                const detailLayers = runwayLayersBySite.get(entry.site.name) || [];
+                detailLayers.forEach((layer, index) => {
+                    layer.setStyle(index % 2 === 0
+                        ? {
+                            color: highlighted ? "#f6e05e" : baseColor,
+                            fillColor: baseColor,
+                            fillOpacity: overviewZoom ? 0 : (highlighted ? 0.55 : 0.35),
+                            opacity: overviewZoom ? 0 : 1,
+                            weight: highlighted ? 4 : 2
+                        }
+                        : {
+                            color: highlighted ? "#fff7ae" : "#f6e05e",
+                            opacity: overviewZoom ? 0 : 1,
+                            weight: highlighted ? 4 : 2
+                        }
+                    );
+                });
+                runwayOutlineLayersBySite.get(entry.site.name)?.setStyle({
+                    color: "#000000",
+                    opacity: overviewZoom ? 0 : 1,
+                    weight: 4
+                });
+            });
+    }
+
+    function applyLegendHighlights() {
+        overviewMarkers.forEach(({ marker, entry }) => {
+            const category = operationalCategory(entry.site);
+            const siteLayer = siteGroups[entry.site.team]?.[category];
+            // Legend selection must never revive or highlight a category the
+            // user hid in the layer drawer. The logical visibility state is
+            // separate from Leaflet's temporary zoom representation, so this
+            // remains correct when overview/detail layers are swapped.
+            const layerVisible = !siteLayer || layerIsEnabled(siteLayer);
+            const highlighted = Boolean(
+                legendCategory &&
+                entry.site.team === legendTeam &&
+                category === legendCategory &&
+                layerVisible
+            );
+            marker.setZIndexOffset(highlighted ? 1100 : 500);
+            marker.getElement()?.classList.toggle("legend-highlighted", highlighted);
+        });
+        refreshAirfieldRunwayStyles();
+    }
+
+    function registerDetailLayer(siteName, layer) {
+        if (!detailLayersBySite.has(siteName)) detailLayersBySite.set(siteName, []);
+        detailLayersBySite.get(siteName).push(layer);
+    }
+
+    function syncDetailVisibility() {
+        const showAllDetails = map.getZoom() >= DETAIL_ZOOM;
+        if (!showAllDetails && !focusedOverviewMarker && focusedDetailGroup.getLayers().length) {
+            // Detail layers retained for a high-zoom empty-map click should
+            // collapse normally once the map returns to overview scale.
+            focusedDetailGroup.clearLayers();
+        }
+        if (!showAllDetails && focusedOverviewMarker && focusedOverviewExpanded) {
+            // Keep the selection, ranges, cards, and routes while returning
+            // an expanded site to its grouped marker at overview zoom.
+            collapseFocusedOverviewSite();
+        }
+        [1, 2].forEach(team => {
+            operationalKeys.forEach(category => {
+                const group = unitGroups[team][category];
+                const siteGroup = siteGroups[team][category];
+                // At the detail zoom, show individual units only when that
+                // layer is enabled. At overview zoom, site markers take its
+                // place, also respecting their own eye/checkbox state.
+                if ((showAllDetails || category === "fleet") && layerIsEnabled(group)) {
+                    if (!map.hasLayer(group)) map.addLayer(group);
+                } else if (map.hasLayer(group)) {
+                    map.removeLayer(group);
+                }
+                if (category !== "fleet") {
+                    if (!showAllDetails && layerIsEnabled(siteGroup)) {
+                        if (!map.hasLayer(siteGroup)) map.addLayer(siteGroup);
+                    } else if (map.hasLayer(siteGroup)) {
+                        map.removeLayer(siteGroup);
+                    }
+                }
+            });
+            const mission = missionGroups[team];
+            [
+                mission.vehicleDepots.objectives,
+                mission.fuelAmmoDepots.objectives,
+            ].forEach(group => {
+                if (showAllDetails && layerIsEnabled(group)) {
+                    if (!map.hasLayer(group)) map.addLayer(group);
+                } else if (map.hasLayer(group)) {
+                    map.removeLayer(group);
+                }
+            });
+        });
+        applyLegendHighlights();
+    }
+
+    map.on("zoomend", syncDetailVisibility);
+
+    function collapseFocusedOverviewSite() {
+        if (!focusedOverviewSite || !focusedOverviewMarker) return;
+        const category = operationalCategory(focusedOverviewSite.site);
+        focusedDetailGroup.clearLayers();
+        const overviewGroup =
+            (siteGroups[focusedOverviewSite.site.team] || siteGroups[1])[category];
+        if (layerIsEnabled(overviewGroup)) {
+            overviewGroup.addLayer(focusedOverviewMarker);
+        }
+        focusedOverviewExpanded = false;
+    }
+
+    function expandFocusedOverviewSite() {
+        if (!focusedOverviewSite || !focusedOverviewMarker) return;
+        const entry = focusedOverviewSite;
+        const category = operationalCategory(entry.site);
+        const overviewGroup =
+            (siteGroups[entry.site.team] || siteGroups[1])[category];
+        overviewGroup.removeLayer(focusedOverviewMarker);
+        entry.siteNames.forEach(siteName => {
+            (detailLayersBySite.get(siteName) || []).forEach(layer =>
+                // A Leaflet layer may only be safely cleared from one
+                // LayerGroup at a time.  At overview scale the normal unit
+                // group is hidden, so these markers are not on the map and
+                // can be attached to the temporary focused group.  Guarding
+                // against already-visible layers prevents a ship (whose
+                // fleet group is always visible) from being removed from the
+                // map when the focused group is cleared.
+                !map.hasLayer(layer) && focusedDetailGroup.addLayer(layer)
+            );
+        });
+        focusedOverviewExpanded = true;
+        const bounds = L.latLngBounds(entry.relatedSites.map(site => {
+            const [x, , z] = site.world_pos;
+            return worldToLatLng(x, z);
+        }));
+        if (bounds.isValid()) map.fitBounds(bounds.pad(0.45), { maxZoom: 2 });
+    }
+
+    function focusOverviewSite(entry, marker) {
+        const category = operationalCategory(entry.site);
+        const loneUnit = ["ewRadars", "strategic"].includes(category) &&
+            entry.units.length === 1 && entry.buildings.length === 0;
+        if (loneUnit) {
+            clearFocusedSite();
+            const [x, , z] = entry.site.world_pos;
+            L.popup({ className: "site-popup", maxWidth: 360, autoPan: false })
+                .setLatLng(worldToLatLng(x, z))
+                .setContent(unitCardHtml(entry.units[0], entry.site, 1))
+                .openOn(map);
+            return;
+        }
+        if (focusedOverviewMarker === marker) {
+            if (!focusedOverviewExpanded) expandFocusedOverviewSite();
+            return;
+        }
+        // Keep prior grouped-site selections and their range rings. Only the
+        // site currently being expanded is collapsed when switching to a
+        // different marker; an empty-map click remains the explicit way to
+        // clear all selections.
+        if (focusedOverviewExpanded) collapseFocusedOverviewSite();
+        focusedOverviewSite = entry;
+        focusedOverviewMarker = marker;
+        focusedOverviewSelections.set(marker, entry);
+        showRoutesForOverviewSite(entry);
+        const [siteX, , siteZ] = entry.site.world_pos;
+        showSamSiteRanges(entry);
+        const popup = L.popup({ className: "site-popup", maxWidth: 360, autoPan: false })
+            .setLatLng(worldToLatLng(siteX, siteZ))
+            .setContent(sitePopupHtml(entry))
+            .openOn(map);
+        bindSitePopupButtons(
+            popup.getElement()?.querySelector(".leaflet-popup-content"),
+            entry
+        );
+    }
+
+    function pinSiteDetails(siteName) {
+        const entry = latestOverviewEntries.find(candidate =>
+            candidate.siteNames.includes(siteName)
+        );
+        (entry?.siteNames || [siteName]).forEach(name => {
+            (detailLayersBySite.get(name) || []).forEach(layer =>
+                // Ships and other detail markers can already be visible in
+                // their normal group.  Do not add those same Leaflet layers
+                // to the temporary group: clearing it would otherwise call
+                // removeFrom(map) and make the original marker disappear.
+                !map.hasLayer(layer) && focusedDetailGroup.addLayer(layer)
+            );
+        });
+    }
+
+    function drawOverviewMarker(entry, targetGroups) {
+        const category = operationalCategory(entry.site);
+        const [x, , z] = entry.displayWorldPos || entry.site.world_pos;
+        const marker = L.marker(worldToLatLng(x, z), {
+            icon: siteOverviewIcon(entry.site.team, category, entry.site),
+            zIndexOffset: 500
+        }).bindTooltip(`
+            <b>${escapeHtml(overviewSiteLabel(entry))}</b><br>
+            ${(overviewUnitSummary(entry).length
+                ? overviewUnitSummary(entry).map(escapeHtml).join("<br>")
+                : "No individual layout is extracted.")}
+        `, { direction: "top", opacity: 0.95 })
+            .addTo((targetGroups[entry.site.team] || targetGroups[1])[category]);
+        marker.on("click", event => {
+            L.DomEvent.stopPropagation(event);
+            focusOverviewSite(entry, marker);
+            window.dispatchEvent(new CustomEvent("ntl:select", { detail: entry.site.name }));
+        });
+        overviewMarkers.push({ marker, entry });
+    }
+
+    function drawOverviewSites(selectedEra) {
+        const entries = overviewSiteRecords(selectedEra);
+        latestOverviewEntries = entries;
+        entries.forEach(entry => {
+            const category = operationalCategory(entry.site);
+            if (category !== "fleet") {
+                drawOverviewMarker(entry, siteGroups);
+            }
+        });
+    }
+
+    function renderSiteLegend() {
+        const panel = document.getElementById("composition-panel");
+        if (!panel) return;
+        const items = [
+            ["strongpoints", "Strongpoint"],
+            ["vehicleDepots", "Vehicle depot"],
+            ["fuelAmmoDepots", "Fuel/ammo depot"],
+            ["shortSams", "Close SAM"],
+            ["longSams", "Long-range SAM"],
+            ["ewRadars", "EW radar"],
+            ["airfields", "Airfield"],
+            ["strategic", "TBM / MLRS"],
+            ["resourceConvoys", "Resource convoys"],
+            ["armoredColumns", "Armoured columns"]
+        ];
+        const selectedEntries = legendCategory
+            && !["resourceConvoys", "armoredColumns"].includes(legendCategory)
+            ? latestOverviewEntries.filter(entry =>
+                entry.site.team === legendTeam &&
+                operationalCategory(entry.site) === legendCategory
+            )
+            : [];
+        const groupedCompositions = [...selectedEntries.reduce((groups, entry) => {
+            const units = compactSiteUnits(entry.units);
+            const buildings = compactSiteBuildings(entry.buildings);
+            const unitKey = units.map(({ unit, count }) =>
+                [unit.name, unit.role, unit.preset, count].join("|")
+            ).join(";");
+            const buildingKey = buildings.map(({ building, count }) =>
+                [building.name, count].join("|")
+            ).join(";");
+            const objectiveKey = operationalCategory(entry.site) === "airfields"
+                ? (/_airfield_main$/.test(String(entry.site.name || "")) ? "main" : "front")
+                : "";
+            const key = `${unitKey}||${buildingKey}||${objectiveKey}`;
+            const group = groups.get(key) || { entry, entries: [] };
+            group.entries.push(entry);
+            groups.set(key, group);
+            return groups;
+        }, new Map()).values()];
+        const selectedLabel = items.find(([category]) => category === legendCategory)?.[1];
+        const convoySelection = ["resourceConvoys", "armoredColumns"].includes(legendCategory);
+        panel.innerHTML = `
+            <p>Click a legend type to highlight every matching site. Click a map site once for ranges and composition; click it again to zoom in.</p>
+            <div class="legend-team-switch" aria-label="Legend composition team">
+                <button type="button" data-legend-team="1" class="${legendTeam === 1 ? "is-selected" : ""}">REDFOR</button>
+                <button type="button" data-legend-team="2" class="${legendTeam === 2 ? "is-selected" : ""}">BLUFOR</button>
+            </div>
+            <div class="site-legend-items">
+                ${items.map(([category, label]) => `
+                    <button type="button" class="site-legend-item ${legendCategory === category ? "is-selected" : ""}" data-legend-category="${category}">
+                        ${siteLegendIcon(legendTeam, category)}${escapeHtml(label)}
+                    </button>
+                `).join("")}
+            </div>
+            ${convoySelection ? `
+                <section class="legend-composition convoy-legend">
+                    <h3 class="composition-section-title">${escapeHtml(selectedLabel)}</h3>
+                    ${convoyLegendHtml(legendCategory)}
+                </section>
+            ` : legendCategory ? `
+                <section class="legend-composition">
+                    <h3 class="composition-section-title">${escapeHtml(legendTeam === 1 ? "REDFOR" : "BLUFOR")} ${escapeHtml(selectedLabel || "site")} composition</h3>
+                    ${groupedCompositions.length ? groupedCompositions.map(group => {
+                        const { entry, entries } = group;
+                        const count = entries.length;
+                        const locations = entries.map(candidate => candidate.site.name).join(" · ");
+                        return `
+                        <details class="composition-site team-${entry.site.team}" open>
+                            <summary>${escapeHtml(compositionSiteLabel(entry.site, count))}</summary>
+                            <p class="composition-site-description">${escapeHtml(
+                                `${count > 1 ? `${count} matching locations: ${locations}. ` : ""}` +
+                                (overviewUnitSummary(entry).join(" · ") || "No individual vehicle layout is extracted.")
+                            )}</p>
+                            <div class="vehicle-card-grid">
+                                ${siteCardHtml(entry)}
+                            </div>
+                        </details>
+                        `;
+                    }).join("") : "<p>No matching sites in this scenario.</p>"}
+                </section>
+            ` : ""}
+            <details class="composition-site respawn-legend">
+                <summary>Respawn and restore timers</summary>
+                <div class="composition-site-description">${respawnLegendHtml()}</div>
+            </details>
+        `;
+        panel.querySelectorAll("[data-legend-team]").forEach(button => {
+            button.addEventListener("click", () => {
+                legendTeam = Number(button.dataset.legendTeam);
+                renderSiteLegend();
+                applyLegendHighlights();
+            });
+        });
+        panel.querySelectorAll("[data-legend-category]").forEach(button => {
+            button.addEventListener("click", () => {
+                legendCategory = legendCategory === button.dataset.legendCategory
+                    ? null
+                    : button.dataset.legendCategory;
+                renderSiteLegend();
+                if (!["resourceConvoys", "armoredColumns"].includes(legendCategory)) {
+                    applyLegendHighlights();
+                } else {
+                    applyLegendHighlights();
+                }
+            });
+        });
+    }
+
+    function drawUnit(unit, site) {
+        const [x, , z] = unit.world_pos;
+        const unitLatLng = worldToLatLng(x, z);
+        const role = String(unit.role || "vehicle").toLowerCase();
+        const name = String(unit.name || "unit");
+        const teamGroups = unitGroups[site.team] || unitGroups[1];
+        const categoryKey = operationalCategory(site);
+        const targetGroup = teamGroups[categoryKey];
+        const specs = globalUnitSpecs[name.toLowerCase()];
+        if (specs) {
+            const detection = specs.sensors?.detection;
+            const tracking = specs.sensors?.tracking;
+            const teamCoverage = coverageGroups[site.team] || coverageGroups[1];
+            const coverageCategory = teamCoverage[categoryKey];
+            const scopeReference = Math.max(
+                ...(detection?.scope_ranges || []),
+                0
+            );
+
+            // EW radar files expose search display scales rather than a
+            // conventional nominal detection radius.  A mission-level
+            // threatSearchRad, when present, is the authoritative AI search
+            // envelope for the map circle.
+            const threatSearch = Number(unit.threat_range);
+            const detectionReference = threatSearch > 0
+                ? threatSearch
+                : detection?.nominal || scopeReference;
+            if (detectionReference) {
+                L.circle(unitLatLng, {
+                    radius: worldRadiusToMapRadius(detectionReference),
+                    color: teamColor(site.team),
+                    fill: false,
+                    weight: 1.5,
+                    opacity: detection?.nominal ? 0.75 : 0.58,
+                    dashArray: "8, 6",
+                    interactive: false
+                }).addTo(coverageCategory.detection);
+            }
+            if (tracking?.nominal) {
+                L.circle(unitLatLng, {
+                    radius: worldRadiusToMapRadius(tracking.nominal),
+                    color: teamColor(site.team),
+                    fill: false,
+                    weight: 1.25,
+                    opacity: 0.8,
+                    dashArray: "2, 5",
+                    interactive: false
+                }).addTo(coverageCategory.tracking);
+            }
+            const engagementRange = displayEngagementRange(unit, specs);
+            if (engagementRange > 0) {
+                L.circle(unitLatLng, {
+                    radius: worldRadiusToMapRadius(engagementRange),
+                    color: teamColor(site.team),
+                    fillColor: teamColor(site.team),
+                    fillOpacity: 0.025,
+                    weight: 1.5,
+                    opacity: 0.9,
+                    interactive: false
+                }).addTo(coverageCategory.engagement);
+            }
+        }
+
+        const hoverIcon = natoIconPath(site.team, unitIconType(unit, site));
+        // Tooltip and card HTML are built on open so image candidates that
+        // already failed on this page are skipped instead of re-requested.
+        const marker = L.marker(unitLatLng, {
+            icon: natoIcon(site.team, unitIconType(unit, site), 30)
+        }).bindTooltip(() => `
+            <div class="unit-hover-tooltip">
+                ${fallbackImageHtml([
+                    ...slotArtUrls(name, specs?.model),
+                    hoverIcon
+                ], "unit-hover-icon")}
+                <span class="unit-hover-text">
+                    <b>${escapeHtml(displayName(name))}</b><br>
+                    ${escapeHtml(displayName(role))}<br>
+                    <small>${escapeHtml(site.name)}</small>
+                </span>
+            </div>
+        `).bindPopup(() => unitCardHtml(unit, site)).addTo(targetGroup);
+        registerDetailLayer(site.name, marker);
+        if (unit.__ntlId) ntlUnitMarkers.set(unit.__ntlId, marker);
+        marker.on("click", event => {
+            stopLeafletClick(event);
+            pinSiteDetails(site.name);
+            window.dispatchEvent(new CustomEvent("ntl:select", { detail: site.name }));
+            // Once the user selects a concrete vehicle, replace the
+            // site-level summary rings with that vehicle's own ranges.
+            clearSamSiteRanges();
+            const selectionKey = [
+                site.team,
+                site.name,
+                name,
+                x.toFixed(2),
+                z.toFixed(2)
+            ].join(":");
+            const rangeSelection = toggleSelectedUnitRanges(
+                selectionKey,
+                unitLatLng,
+                unit,
+                site,
+                specs
+            );
+            if (isGroundUnit(unit, site)) {
+                const closesDisclaimer = rangeSelection === "removed" || (
+                    rangeSelection === "unavailable" &&
+                    rangeDisclaimerSelectionKey === selectionKey
+                );
+                if (closesDisclaimer) {
+                    clearRangeDisclaimer();
+                } else {
+                    showRangeDisclaimer(selectionKey);
+                }
+            }
+            if (categoryKey === "vehicleDepots" || categoryKey === "fuelAmmoDepots") {
+                selectDepotRoutes(site, unitLatLng, event, true);
+            }
+            marker.openPopup();
+        });
+
+    }
+
+    function drawVehicleDepotBuilding(building, site) {
+        const name = String(building.name || "").toLowerCase();
+        const data = BUILDING_CARD_DATA[name];
+        if (!data) return false;
+
+        const [x, , z] = building.world_pos;
+        const targetGroup =
+            (unitGroups[site.team] || unitGroups[1])[operationalCategory(site)];
+        const marker = L.marker(worldToLatLng(x, z), {
+            icon: natoIcon(site.team, data.icon, 26),
+            pane: "depotMarkers",
+            zIndexOffset: 1200,
+            riseOnHover: true
+        }).bindTooltip(`
+            <b>${escapeHtml(data.label)}</b><br>
+            ${data.hp.toLocaleString()} HP<br>
+            Site: ${escapeHtml(site.name)}<br>
+            Structure: ${escapeHtml(displayName(building.name))}<br>
+            Position: [${x.toFixed(1)}, ${z.toFixed(1)}]
+        `).bindPopup(() => buildingCardHtml(building, site), { maxWidth: 360 })
+            .addTo(targetGroup);
+        marker.on("click", event => {
+            selectDepotRoutes(site, worldToLatLng(x, z), event, true);
+            pinSiteDetails(site.name);
+            window.dispatchEvent(new CustomEvent("ntl:select", { detail: site.name }));
+            marker.openPopup();
+        });
+        registerDetailLayer(site.name, marker);
+        if (building.__ntlId) ntlUnitMarkers.set(building.__ntlId, marker);
+        return true;
+    }
+
+    function renderMapData(selectedEra) {
+        ntlUnitMarkers.clear();
+        clearSelectedRanges();
+        clearFocusedSite();
+        renderedGroups.forEach(group => group.clearLayers());
+        detailLayersBySite.clear();
+        overviewMarkers.length = 0;
+        runwayLayersBySite.clear();
+        runwayOutlineLayersBySite.clear();
+
+        globalSiteData.forEach(site => {
+            (site.runways || []).forEach(runway => {
+                drawRunway(runway, site);
+            });
+
+            if (site.route?.points?.length) {
+                drawShipRoute(site.route, site);
+            }
+
+            const units = site.units_by_era?.[selectedEra] || [];
+            units.forEach((unit, index) => {
+                unit.__ntlId = [currentMapVariant, selectedEra, site.name, "unit", unit.id || index].join("|");
+                drawUnit(unit, site);
+            });
+
+            const buildings = site.buildings_by_era?.[selectedEra] || [];
+            buildings.forEach((building, index) => {
+                building.__ntlId = [currentMapVariant, selectedEra, site.name, "building", building.id || index].join("|");
+                drawVehicleDepotBuilding(building, site);
+            });
+        });
+
+        drawOverviewSites(selectedEra);
+        renderSiteLegend();
+        syncDetailVisibility();
+        // Scenario, side and map changes all redraw through here.
+        if (threatCoverEnabled) renderThreatCover();
+        window.dispatchEvent(new Event("ntl:context"));
+    }
+
+    document.getElementById("team-swap").addEventListener("click", () => {
+        const definition = activeMapDefinition();
+        // The button starts disabled and is enabled by updateTeamSwapUi once
+        // the map variants are loaded; guard as well in case it is clicked
+        // programmatically before then.
+        if (!definition.supportsTeamSwap || !globalSiteData.length) return;
+        activateMapVariant(
+            currentMapVariant === definition.mirroredVariant
+                ? definition.defaultVariant
+                : definition.mirroredVariant
+        );
+    });
+
+    function renderIconFamilySelector() {
+        const selector = document.getElementById("icon-family-options");
+        if (!selector) return;
+        const previews = {
+            vanilla: ["images/icons/vanilla/def_spaa_radar.svg", 0],
+            nato: ["images/icons/nato/def_nato_ally_sam_radar.svg", 2],
+            pact: ["images/icons/pact/def_ussr_sam_radar.svg", 1]
+        };
+        Object.entries(previews).forEach(([family, [path, team]]) => {
+            const button = selector.querySelector(`[data-icon-family="${family}"]`);
+            const image = button?.querySelector("img");
+            const source = vectorIconDataUri(team, family, path);
+            if (image && source) image.src = source;
+            button?.classList.toggle("is-selected", activeIconFamily() === family);
+            button?.setAttribute("aria-pressed", String(activeIconFamily() === family));
+        });
+    }
+
+    document.getElementById("icon-family-options")?.addEventListener("click", event => {
+        const button = event.target.closest("[data-icon-family]");
+        if (!button) return;
+        iconFamily = button.dataset.iconFamily === "vanilla" || button.dataset.iconFamily === "pact"
+            ? button.dataset.iconFamily
+            : "nato";
+        saveUiState({ iconFamily });
+        renderIconFamilySelector();
+        refreshLayerFolderIcons();
+        // Mission objective markers (including depot buildings) are created
+        // while the active variant is drawn. Rebuild that variant as well as
+        // the map units so every marker uses the newly selected icon family;
+        // otherwise a stale NATO depot icon can remain underneath detail
+        // markers after switching to WT or USSR symbols.
+        if (globalSiteData.length) activateMapVariant(currentMapVariant);
+    });
+
+    function formatDistance(meters) {
+        const value = Number(meters);
+        if (!Number.isFinite(value)) return "unknown";
+        if (value >= 1000) {
+            return `${(value / 1000).toLocaleString(undefined, {
+                maximumFractionDigits: 1
+            })} km`;
+        }
+        return `${value.toLocaleString()} m`;
+    }
+
+    function formatSeconds(seconds) {
+        const value = Number(seconds);
+        if (!Number.isFinite(value) || value <= 0) return "";
+        return `${value.toLocaleString(undefined, {
+            maximumFractionDigits: 2
+        })} s`;
+    }
+
+    Promise.all([
+        fetch("map_data.json").then(response => {
+            if (!response.ok) throw new Error(`map_data.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("map_data_mirror.json").then(response => {
+            if (!response.ok) throw new Error(`map_data_mirror.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("road_network.json").then(response => {
+            if (!response.ok) throw new Error(`road_network.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("road_network_city.json").then(response => {
+            if (!response.ok) throw new Error(`road_network_city.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("navmesh_city.json").then(response => {
+            if (!response.ok) throw new Error(`navmesh_city.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("mission_logic.json").then(response => {
+            if (!response.ok) throw new Error(`mission_logic.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("mission_logic_mirror.json").then(response => {
+            if (!response.ok) throw new Error(`mission_logic_mirror.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("map_data_city.json").then(response => {
+            if (!response.ok) throw new Error(`map_data_city.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("mission_logic_city.json").then(response => {
+            if (!response.ok) throw new Error(`mission_logic_city.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("map_data_city_mirror.json").then(response => {
+            if (!response.ok) throw new Error(`map_data_city_mirror.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("mission_logic_city_mirror.json").then(response => {
+            if (!response.ok) throw new Error(`mission_logic_city_mirror.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("presets.json").then(response => {
+            if (!response.ok) throw new Error(`presets.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("unit_specs.json").then(response => {
+            if (!response.ok) throw new Error(`unit_specs.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("unit_display_names.json").then(response => {
+            if (!response.ok) throw new Error(`unit_display_names.json: HTTP ${response.status}`);
+            return response.json();
+        }),
+        fetch("icon_templates.json").then(response => {
+            if (!response.ok) throw new Error(`icon_templates.json: HTTP ${response.status}`);
+            return response.json();
+        })
+    ])
+        .then(([
+            standardSiteData,
+            mirrorSiteData,
+            roadData,
+            cityRoadData,
+            cityNavmeshData,
+            standardLogicData,
+            mirrorLogicData,
+            citySiteData,
+            cityLogicData,
+            cityMirrorSiteData,
+            cityMirrorLogicData,
+            presetData,
+            unitSpecs,
+            unitDisplayNames,
+            iconTemplates
+        ]) => {
+            globalMapVariants = {
+                standard: standardSiteData,
+                mirror: mirrorSiteData,
+                city: citySiteData,
+                city_mirror: cityMirrorSiteData
+            };
+            globalMissionLogicVariants = {
+                standard: standardLogicData,
+                mirror: mirrorLogicData,
+                city: cityLogicData,
+                city_mirror: cityMirrorLogicData
+            };
+            globalPresetData = presetData;
+            globalUnitSpecs = unitSpecs;
+            globalUnitDisplayNames = unitDisplayNames || {};
+            globalIconTemplates = iconTemplates || { nato: {}, vanilla: {}, pact: {}, aircraft: {} };
+            renderIconFamilySelector();
+            refreshLayerFolderIcons();
+            globalRoadData = roadData;
+            globalRoadDataByMap = {
+                archipelago: roadData,
+                city: cityRoadData
+            };
+            globalNavmeshDataByMap = {
+                city: cityNavmeshData
+            };
+            populateMapSelector();
+            populateScenarioSelector();
+            refreshMapArtwork();
+            activateMapVariant(currentMapVariant);
+        })
+        .catch(error => {
+            console.error("Could not load map data:", error);
+            const message = window.location.protocol === "file:"
+                ? "Map data cannot load from a local file. Run a local web server (see README)."
+                : `Map data could not be loaded: ${error?.message || error}`;
+            const options = document.getElementById("map-options");
+            if (options) {
+                options.textContent = message;
+                options.setAttribute("role", "alert");
+            }
+        });
+
+    // Folder-eye state is deliberately session-only. Each folder remembers
+    // the mix of visible descendants that existed immediately before the
+    // folder was hidden, so clicking the eye again restores that mix instead
+    // of enabling every option.
+    const folderVisibilitySnapshots = new Map();
+    // Track the user's eye/checkbox choices separately from map membership.
+    // Zooming temporarily removes overview/detail layers, but must not
+    // re-enable a layer the user deliberately hid.
+    const userLayerVisibility = new Map();
+    const zoomManagedLayers = new Set([
+        ...Object.values(unitGroups).flatMap(groups => Object.values(groups)),
+        ...Object.values(siteGroups).flatMap(groups => Object.values(groups)),
+        ...Object.values(missionGroups).flatMap(groups => [
+            groups.vehicleDepots.objectives,
+            groups.fuelAmmoDepots.objectives
+        ])
+    ]);
+
+    function layerIsEnabled(layer) {
+        if (userLayerVisibility.has(layer)) {
+            return userLayerVisibility.get(layer) === true;
+        }
+        return zoomManagedLayers.has(layer) || map.hasLayer(layer);
+    }
+
+    function layerOption(label, layer) {
+        return { label, layer };
+    }
+
+    function folderOptions(team, key, additionalOptions = []) {
+        const coverage = coverageGroups[team][key];
+        if (key === "fleet") {
+            return [
+                layerOption("Ships", unitGroups[team][key]),
+                ...additionalOptions,
+                layerOption("Radar detection", coverage.detection),
+                layerOption("Radar tracking", coverage.tracking),
+                layerOption("Weapon engagement", coverage.engagement)
+            ];
+        }
+        return [
+            layerOption(
+                "Site markers",
+                siteGroups[team][key]
+            ),
+            layerOption(
+                "Individual units",
+                unitGroups[team][key]
+            ),
+            ...additionalOptions,
+            layerOption("Radar detection", coverage.detection),
+            layerOption("Radar tracking", coverage.tracking),
+            layerOption("Weapon engagement", coverage.engagement)
+        ];
+    }
+
+    function forceFolder(team, title, key, iconType, additionalOptions = [], glyph = "") {
+        return {
+            title,
+            team,
+            key,
+            iconType,
+            glyph,
+            options: folderOptions(team, key, additionalOptions)
+        };
+    }
+
+    function makeForceCategory(team, title) {
+        const mission = missionGroups[team];
+        return {
+            title,
+            team,
+            open: false,
+            force: true,
+            glyph: "●",
+            children: [
+                forceFolder(
+                    team,
+                    "Strongpoints",
+                    "strongpoints",
+                    "tank",
+                    [
+                        layerOption(
+                            "Capture zones",
+                            mission.strongpoints.capture
+                        )
+                    ]
+                ),
+                forceFolder(
+                    team,
+                    "Vehicle depots",
+                    "vehicleDepots",
+                    "tank_storage",
+                    [
+                        layerOption(
+                            "Depot markers",
+                            mission.vehicleDepots.objectives
+                        ),
+                        layerOption(
+                            "Capture zones",
+                            mission.vehicleDepots.capture
+                        ),
+                        layerOption(
+                            "Likely armored-column routes",
+                            mission.vehicleDepots.armored
+                        )
+                    ]
+                ),
+                forceFolder(
+                    team,
+                    "Fuel/ammo depots",
+                    "fuelAmmoDepots",
+                    ["fuel_storage", "ammo_storage"],
+                    [
+                        layerOption(
+                            "Depot markers",
+                            mission.fuelAmmoDepots.objectives
+                        ),
+                        layerOption(
+                            "Capture zones",
+                            mission.fuelAmmoDepots.capture
+                        ),
+                        layerOption(
+                            "Likely convoy links",
+                            mission.fuelAmmoDepots.convoy
+                        )
+                    ]
+                ),
+                forceFolder(team, "Short SAMs", "shortSams", "spaa"),
+                forceFolder(team, "Long SAMs", "longSams", "sam"),
+                forceFolder(
+                    team,
+                    "EW radars",
+                    "ewRadars",
+                    "radar_station"
+                ),
+                forceFolder(
+                    team,
+                    "Airfields",
+                    "airfields",
+                    null,
+                    [
+                        layerOption("Landing strips", mission.airfields.runways),
+                        layerOption("Capture zones", mission.airfields.capture)
+                    ],
+                    "✈"
+                ),
+                forceFolder(
+                    team,
+                    "TBM/MLRS",
+                    "strategic",
+                    ["mlrs", "tbm"],
+                    [
+                        layerOption("MLRS spawn areas", mission.strategic.mlrsSpawn),
+                        layerOption("TBM spawn areas", mission.strategic.tbmSpawn),
+                        layerOption(
+                            "MLRS relocation areas",
+                            mission.strategic.mlrsMove
+                        ),
+                        layerOption(
+                            "TBM relocation areas",
+                            mission.strategic.tbmMove
+                        ),
+                        layerOption(
+                            "Eligible enemy targets",
+                            mission.strategic.targets
+                        ),
+                        layerOption(
+                            "Strategic bomber spawns",
+                            mission.strategic.bombers
+                        )
+                    ]
+                ),
+                forceFolder(
+                    team,
+                    "Fleet",
+                    "fleet",
+                    "aircraft_carrier",
+                    [
+                        layerOption("Patrol routes", mission.fleet.routes)
+                    ]
+                )
+            ]
+        };
+    }
+
+    function makeMapCategory() {
+        const definition = activeMapDefinition();
+        const children = [];
+        if (definition.supportsTerrain) {
+            children.push({
+                title: "Terrain",
+                open: true,
+                glyph: "⌁",
+                options: [
+                    layerOption("True topographic terrain", topographicMapLayer)
+                ]
+            });
+        }
+        if (definition.supportsRoads) {
+            children.push({
+                title: "Road network",
+                glyph: "╫",
+                options: [
+                    layerOption("Asphalt roads", asphaltRoadGroup),
+                    layerOption("Gravel/sand roads", gravelRoadGroup)
+                ]
+            });
+        }
+        return {
+            title: definition.supportsTerrain ? "MAP & TERRAIN" : "MAP",
+            open: true,
+            force: true,
+            glyph: "⌖",
+            children
+        };
+    }
+
+    function addGroupedLayerControl(forces) {
+        const control = L.control({ position: "topright" });
+        control.onAdd = () => {
+            const drawer = L.DomUtil.create("div", "layers-drawer");
+            const container = L.DomUtil.create("div", "grouped-layers", drawer);
+            const toggle = L.DomUtil.create("button", "layers-drawer-toggle", drawer);
+            toggle.type = "button";
+            function setDrawerCollapsed(collapsed) {
+                drawer.classList.toggle("is-collapsed", collapsed);
+                toggle.textContent = collapsed ? "‹" : "›";
+                toggle.setAttribute("aria-expanded", String(!collapsed));
+                toggle.setAttribute(
+                    "aria-label",
+                    collapsed ? "Expand layer controls" : "Collapse layer controls"
+                );
+            }
+            toggle.addEventListener("click", () => {
+                const collapsed = !drawer.classList.contains("is-collapsed");
+                setDrawerCollapsed(collapsed);
+                saveUiState({ layersCollapsed: collapsed });
+            });
+            // The control is rebuilt on every map switch; keep its state.
+            setDrawerCollapsed(drawerStartsCollapsed(uiState.layersCollapsed));
+            L.DomEvent.disableClickPropagation(drawer);
+            L.DomEvent.disableScrollPropagation(drawer);
+
+            function descendantOptions(node) {
+                return [
+                    ...(node.options || []),
+                    ...(node.children || []).flatMap(descendantOptions)
+                ];
+            }
+
+            function ancestorVisibilitySnapshot(nodePath) {
+                let ancestorPath = String(nodePath || "");
+                while (ancestorPath.includes("/")) {
+                    ancestorPath = ancestorPath.slice(
+                        0,
+                        ancestorPath.lastIndexOf("/")
+                    );
+                    const snapshot = folderVisibilitySnapshots.get(ancestorPath);
+                    if (snapshot) return snapshot;
+                }
+                return null;
+            }
+
+            function clearDescendantSnapshots(nodePath) {
+                const prefix = `${nodePath}/`;
+                [...folderVisibilitySnapshots.keys()]
+                    .filter(path => path.startsWith(prefix))
+                    .forEach(path => folderVisibilitySnapshots.delete(path));
+            }
+
+            function setOptionVisibility(option, visible, rememberUser = true) {
+                if (rememberUser) {
+                    userLayerVisibility.set(option.layer, Boolean(visible));
+                }
+                option.checkbox.checked = visible;
+                if (visible && !map.hasLayer(option.layer)) {
+                    option.layer.addTo(map);
+                } else if (!visible && map.hasLayer(option.layer)) {
+                    map.removeLayer(option.layer);
+                }
+            }
+
+            function refreshFolderEye(node) {
+                if (!node.eyeButton) return;
+                const options = descendantOptions(node);
+                const visibleCount = options.filter(option =>
+                    layerIsEnabled(option.layer)
+                ).length;
+                const anyVisible = visibleCount > 0;
+                const allVisible = visibleCount === options.length;
+                const hasSnapshot = folderVisibilitySnapshots.has(node.visibilityPath);
+                const inheritedSnapshot = !anyVisible
+                    ? ancestorVisibilitySnapshot(node.visibilityPath)
+                    : null;
+                node.eyeButton.classList.toggle("active", anyVisible);
+                node.eyeButton.classList.toggle(
+                    "partial",
+                    anyVisible && !allVisible
+                );
+                node.eyeButton.title = hasSnapshot || inheritedSnapshot
+                    ? `Restore previous ${node.title}`
+                    : anyVisible
+                        ? `Hide all ${node.title}`
+                        : `Show all ${node.title}`;
+                node.eyeButton.setAttribute(
+                    "aria-label",
+                    node.eyeButton.title
+                );
+                node.eyeButton.setAttribute(
+                    "aria-pressed",
+                    String(anyVisible)
+                );
+            }
+
+            function refreshAllFolderEyes() {
+                function refreshTree(node) {
+                    refreshFolderEye(node);
+                    (node.children || []).forEach(refreshTree);
+                }
+                forces.forEach(refreshTree);
+            }
+
+            function makeHeaderIcon(node) {
+                const icon = document.createElement("span");
+                icon.className = "folder-icon";
+                if (node.iconType) {
+                    const iconTypes = Array.isArray(node.iconType)
+                        ? node.iconType
+                        : [node.iconType];
+                    if (iconTypes.length > 1) icon.classList.add("multi");
+                    iconTypes.forEach(iconType => {
+                        const image = document.createElement("img");
+                        // Kept on the element so refreshLayerFolderIcons can
+                        // redraw it for another icon family.
+                        image.dataset.folderIconType = iconType;
+                        image.dataset.team = String(node.team ?? "");
+                        image.src = natoIconPath(node.team, iconType);
+                        image.alt = "";
+                        icon.appendChild(image);
+                    });
+                } else {
+                    icon.textContent = node.glyph || "•";
+                }
+                return icon;
+            }
+
+            function renderNode(node, isForce = false, parentPath = "") {
+                const segment = node.key || (
+                    node.force && !node.team
+                        ? "map"
+                        : node.team
+                            ? `team-${node.team}`
+                            : String(node.title || "folder")
+                                .toLowerCase()
+                                .replace(/[^a-z0-9]+/g, "-")
+                                .replace(/^-|-$/g, "")
+                );
+                const nodePath = parentPath
+                    ? `${parentPath}/${segment}`
+                    : segment;
+                node.visibilityPath = nodePath;
+                const details = document.createElement("details");
+                details.open = Boolean(node.open);
+                if (isForce) details.classList.add("force-details");
+                const summary = document.createElement("summary");
+                const eyeButton = document.createElement("button");
+                eyeButton.type = "button";
+                eyeButton.className = "folder-eye";
+                eyeButton.textContent = "◉";
+                node.eyeButton = eyeButton;
+                eyeButton.addEventListener("click", event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const options = descendantOptions(node);
+                    const snapshot = folderVisibilitySnapshots.get(nodePath);
+                    if (snapshot) {
+                        options.forEach(option => {
+                            setOptionVisibility(
+                                option,
+                                snapshot.get(option.layer) ?? false
+                            );
+                        });
+                        folderVisibilitySnapshots.delete(nodePath);
+                        clearDescendantSnapshots(nodePath);
+                        // Reapply the current zoom representation after
+                        // restoring the logical layer choices. Otherwise a
+                        // restore briefly/additionally displays both site
+                        // markers and individual units at once.
+                        syncDetailVisibility();
+                        refreshAllFolderEyes();
+                        return;
+                    }
+                    const anyVisible = options.some(option =>
+                        layerIsEnabled(option.layer)
+                    );
+                    if (anyVisible) {
+                        folderVisibilitySnapshots.set(
+                            nodePath,
+                            new Map(options.map(option => [
+                                option.layer,
+                                layerIsEnabled(option.layer)
+                            ]))
+                        );
+                        clearDescendantSnapshots(nodePath);
+                        options.forEach(option => setOptionVisibility(option, false));
+                    } else {
+                        // If an ancestor folder was hidden, restore this
+                        // child from the ancestor's saved mix instead of
+                        // turning on every descendant layer.
+                        const inheritedSnapshot = ancestorVisibilitySnapshot(nodePath);
+                        if (inheritedSnapshot) {
+                            options.forEach(option => setOptionVisibility(
+                                option,
+                                inheritedSnapshot.get(option.layer) ?? false
+                            ));
+                        } else {
+                            options.forEach(option => setOptionVisibility(option, true));
+                        }
+                    }
+                    syncDetailVisibility();
+                    refreshAllFolderEyes();
+                });
+
+                const triangle = document.createElement("span");
+                triangle.className = "folder-triangle";
+                triangle.textContent = "▸";
+                triangle.setAttribute("aria-hidden", "true");
+
+                const title = document.createElement("span");
+                title.className = "folder-title";
+                title.textContent = node.title;
+                summary.append(
+                    eyeButton,
+                    triangle,
+                    makeHeaderIcon(node),
+                    title
+                );
+                if (node.team === 1) summary.classList.add("team-red");
+                if (node.team === 2) summary.classList.add("team-blue");
+                details.appendChild(summary);
+
+                if (node.children?.length) {
+                    const children = document.createElement("div");
+                    children.className = "force-children";
+                    node.children.forEach(child => {
+                        children.appendChild(renderNode(child, false, nodePath));
+                    });
+                    details.appendChild(children);
+                }
+
+                if (node.options?.length) {
+                    const options = document.createElement("div");
+                    options.className = "layer-options";
+                    node.options.forEach(option => {
+                        const label = document.createElement("label");
+                        const checkbox = document.createElement("input");
+                        checkbox.type = "checkbox";
+                        option.checkbox = checkbox;
+                        checkbox.checked = layerIsEnabled(option.layer);
+                        checkbox.addEventListener("change", () => {
+                            setOptionVisibility(option, checkbox.checked);
+                            // Site markers and individual units swap by zoom
+                            // level; re-apply that after a manual toggle.
+                            syncDetailVisibility();
+                            refreshAllFolderEyes();
+                        });
+                        label.append(
+                            checkbox,
+                            document.createTextNode(option.label)
+                        );
+                        options.appendChild(label);
+                    });
+                    details.appendChild(options);
+                }
+                return details;
+            }
+
+            forces.forEach(force => {
+                container.appendChild(renderNode(force, true));
+            });
+            refreshAllFolderEyes();
+            return drawer;
+        };
+        control.addTo(map);
+        return control;
+    }
+
+    let groupedLayerControl = null;
+
+    // Redraw the drawer's folder icons in place (icon family change, or
+    // templates arriving after the first build) so open folders and the
+    // drawer's collapsed state are untouched.
+    function refreshLayerFolderIcons() {
+        document.querySelectorAll(".grouped-layers img[data-folder-icon-type]").forEach(image => {
+            const team = Number(image.dataset.team) || undefined;
+            image.src = natoIconPath(team, image.dataset.folderIconType);
+        });
+    }
+
+    function rebuildGroupedLayerControl() {
+        groupedLayerControl?.remove();
+        groupedLayerControl = addGroupedLayerControl([
+            makeMapCategory(),
+            makeForceCategory(1, "REDFOR"),
+            makeForceCategory(2, "BLUFOR")
+        ]);
+    }
+
+    rebuildGroupedLayerControl();
+
+
+// Explicit boundary around the preserved upstream engine. Live changes never call renderMapData.
+window.ntlMap = {
+    map, L,
+    get ready() { return globalSiteData.length > 0; },
+    context() { return { mapId: currentMapId, variant: currentMapVariant, scenario: selectedPresetId() }; },
+    sites() { return globalSiteData; },
+    variants() { return globalMapVariants; },
+    definitions: MAP_DEFINITIONS,
+    presets() { return globalPresetData.presets; },
+    mission() { return globalMissionLogic; },
+    roads() { return globalRoadDataByMap[currentMapId] || []; },
+    convoyRoutes() {
+        return [
+            ...(globalMissionLogic?.likely_convoy_links || []).map(link => ({ key: convoyRouteKey(link), points: globalConvoyRoutes.get(convoyRouteKey(link))?.worldPoints || [link.from, link.to], link, kind: 'Resource convoy' })),
+            ...(globalMissionLogic?.likely_armored_links || []).map(link => ({ key: armoredRouteKey(link), points: globalArmoredRoutes.get(armoredRouteKey(link))?.worldPoints || [link.from, link.to], link, kind: 'Armored column' }))
+        ].filter(route => route.points.every(p => Array.isArray(p) && p.length >= 3));
+    },
+    specs(name) { return globalUnitSpecs[String(name).toLowerCase()] || {}; },
+    category: operationalCategory,
+    displayName,
+    lifecycle: lifecycleForUnit,
+    worldToLatLng,
+    latLngToWorld: mapLatLngToWorld,
+    terrain: terrainHeightAtMapPoint,
+    setContext(mapId, variant, scenario) {
+        if (mapId && mapId !== currentMapId && MAP_DEFINITIONS[mapId]) {
+            currentMapId = mapId;
+            saveUiState({ map: mapId });
+            clearPlanningTools(); refreshMapArtwork(); populateMapSelector(); rebuildGroupedLayerControl();
+        }
+        if (scenario && globalPresetData.presets.some(p => p.id === scenario)) {
+            document.getElementById('scenario-options').value = scenario;
+            saveUiState({ scenario });
+        }
+        activateMapVariant(variant || activeMapDefinition().defaultVariant);
+    },
+    focus(siteName) {
+        const found = overviewMarkers.find(item => item.entry.site.name === siteName || item.entry.siteNames.includes(siteName));
+        if (found) focusOverviewSite(found.entry, found.marker);
+        else { const site = globalSiteData.find(s => s.name === siteName); if (site) map.setView(worldToLatLng(site.world_pos[0], site.world_pos[2]), 1); }
+    },
+    markUnit(id, status) {
+        const marker = ntlUnitMarkers.get(id);
+        if (!marker) return;
+        const apply = () => {
+            const el = marker.getElement();
+            if (el) { el.dataset.ntlStatus = status; el.classList.toggle('ntl-destroyed', status === 'DESTROYED'); el.classList.toggle('ntl-damaged', status === 'DAMAGED'); }
+        };
+        if (marker._ntlApply) marker.off('add', marker._ntlApply);
+        marker._ntlApply = apply; marker.on('add', apply); apply();
+    },
+    markSite(name, status) {
+        const item = overviewMarkers.find(x => x.entry.site.name === name);
+        if (!item) return;
+        const apply = () => { const el = item.marker.getElement(); if (el) { el.dataset.ntlStatus = status; el.classList.toggle('ntl-destroyed', status === 'DESTROYED'); el.classList.toggle('ntl-damaged', status === 'DAMAGED'); } };
+        if (item.marker._ntlApply) item.marker.off('add', item.marker._ntlApply); item.marker._ntlApply = apply; item.marker.on('add', apply); apply();
+    }
+};

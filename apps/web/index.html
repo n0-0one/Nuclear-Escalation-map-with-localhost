@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Nuclear Thunder Live</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" sizes="any">
+
+    <link rel="stylesheet" href="./vendor/leaflet/leaflet.css">
+    <script src="./vendor/leaflet/leaflet.js"></script>
+
+    <link rel="stylesheet" href="./legacy.css">
+</head>
+<body>
+
+<div class="info-panel">
+    <div class="title">Nuclear Thunder Interactive Map</div>
+
+    <div class="map-selector" id="map-selector">
+        <span id="map-options">Loading maps…</span>
+    </div>
+
+    <div class="era-selector" id="scenario-selector">
+        <div class="scenario-select-row">
+            <select id="scenario-options" aria-label="Scenario" disabled>
+                <option>Loading scenarios…</option>
+            </select>
+        </div>
+    </div>
+
+    <button id="team-swap" class="team-swap" type="button" aria-pressed="false" disabled>
+        SWAP SIDES
+    </button>
+
+    <div class="icon-family-selector">
+        <div id="icon-family-options" class="icon-family-options" role="radiogroup" aria-label="Map icon style">
+            <button type="button" class="icon-family-option" data-icon-family="vanilla" aria-label="WT icons" title="WT icons">
+                <img data-icon-preview="vanilla" src="images/icons/vanilla/def_spaa_radar.svg" alt="">
+            </button>
+            <button type="button" class="icon-family-option is-selected" data-icon-family="nato" aria-label="NATO icons" title="NATO icons">
+                <img data-icon-preview="nato" src="images/icons/nato/def_nato_ally_sam_radar.svg" alt="">
+            </button>
+            <button type="button" class="icon-family-option" data-icon-family="pact" aria-label="USSR icons" title="USSR icons">
+                <img data-icon-preview="pact" src="images/icons/pact/def_ussr_sam_radar.svg" alt="">
+            </button>
+        </div>
+    </div>
+
+    <p class="feedback-contact">Updated 2.59.0.62<br>Feedback: Discord @majorlier</p>
+</div>
+
+<aside id="composition-window" class="composition-window">
+    <button id="composition-window-toggle" class="drawer-toggle" type="button"
+        aria-label="Collapse map legend" aria-expanded="true">›</button>
+    <section class="composition-drawer">
+        <h2 class="legend-heading">Map legend</h2>
+        <section id="composition-panel" class="composition-panel" aria-live="polite">
+            <p>Loading map legend…</p>
+        </section>
+    </section>
+</aside>
+
+<div id="map"></div>
+
+<script src="./legacy.js"></script>
+<script type="module" src="./src/main.ts"></script>
+
+</body>
+</html>

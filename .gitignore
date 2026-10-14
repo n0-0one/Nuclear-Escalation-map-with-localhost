@@ -1,0 +1,13 @@
+node_modules/
+dist/
+target/
+upstream/
+test-results/
+playwright-report/
+.local/
+*.log
+release/
+docs/master-request.md
+docs/verification/
+tests/fixtures/observed-localhost.json
+

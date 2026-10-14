@@ -1,0 +1,30 @@
+{
+  "name": "nuclear-thunder-live",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build && node scripts/validate-build.mjs",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "test": "vitest run",
+    "test:browser": "playwright test",
+    "desktop:dev": "node scripts/desktop.mjs dev",
+    "desktop:build": "node scripts/desktop.mjs build",
+    "bridge": "cargo run -p ntl-bridge --",
+    "validate:data": "node scripts/validate-build.mjs --source"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "leaflet": "1.9.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/leaflet": "^1.9.20",
+    "@types/node": "^24.0.0",
+    "typescript": "~5.9.0",
+    "vite": "^7.1.0",
+    "vitest": "^5.0.4"
+  }
+}
