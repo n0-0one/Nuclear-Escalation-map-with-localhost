@@ -11,4 +11,4 @@ Workspace audited: empty on 2026-10-14. Source snapshot: majorlier/nuclear-thund
 
 The existing renderer remains JavaScript to reduce migration risk; new application logic is TypeScript. No React rewrite or iframe. Map state and simulation are separated. Real localhost is available during this implementation, but mission/scenario and precise per-component kill events are not present in the observed schema.
 
-Deployment target is the user's independent GitHub Pages repository. No remote repository was specified; workflows and artifacts can be delivered locally without publishing to an invented account.
+Deployment target supplied by the user: n0-0one/Nuclear-Escalation-map-with-localhost. Local origin is configured. The repository was private and empty when inspected; publication is pending local Git authentication and a successful Pages deployment. See acceptance.md for the final executed checks.

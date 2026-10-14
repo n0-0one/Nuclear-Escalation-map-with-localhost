@@ -37,13 +37,13 @@ def add_docs(archive):
         if file.name != 'master-request.md':
             archive.write(file, 'docs/' + file.name)
 
-with zipfile.ZipFile(output / f'Nuclear-Thunder-Live-{version}-Windows.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+with zipfile.ZipFile(output / f'Nuclear-Thunder-Live-{version}-Windows.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False) as archive:
     for name in ['Nuclear-Thunder-Live.exe', 'ntl-bridge.exe']:
         archive.write(output / name, name)
     add_docs(archive)
     archive.writestr('START-HERE.txt', 'Extract this folder and run Nuclear-Thunder-Live.exe. Requires WebView2.\nThe desktop connects to War Thunder directly. ntl-bridge.exe is optional and only needed for the browser version.\nSee README.md and docs/acceptance.md for usage and verified limits.\n')
 
-with zipfile.ZipFile(output / f'Nuclear-Thunder-Live-{version}-Web.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+with zipfile.ZipFile(output / f'Nuclear-Thunder-Live-{version}-Web.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False) as archive:
     add_tree(archive, root / 'dist', 'dist')
     add_docs(archive)
     archive.writestr('START-HERE.txt', 'Serve the dist directory using any static HTTP server, for example:\npython -m http.server 4173 --bind 127.0.0.1 --directory dist\nThen open http://127.0.0.1:4173 . Do not open index.html using file://.\n')
@@ -51,7 +51,7 @@ with zipfile.ZipFile(output / f'Nuclear-Thunder-Live-{version}-Web.zip', 'w', zi
 tracked = subprocess.check_output(['git', 'ls-files', '-z'], cwd=root).decode('utf-8').split('\0')
 if 'package.json' not in tracked:
     raise RuntimeError('Stage the source files in Git before packaging the source archive')
-with zipfile.ZipFile(output / f'Nuclear-Thunder-Live-{version}-Source.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+with zipfile.ZipFile(output / f'Nuclear-Thunder-Live-{version}-Source.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False) as archive:
     for relative in tracked:
         if relative:
             archive.write(root / relative, f'nuclear-thunder-live-{version}/{relative}')
