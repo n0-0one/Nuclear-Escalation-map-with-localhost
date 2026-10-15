@@ -1,12 +1,14 @@
 import {chromium} from '@playwright/test';
 import {mkdirSync,writeFileSync} from 'node:fs';
 import assert from 'node:assert/strict';
+const baseURL = (process.env.NTL_BASE_URL || 'http://127.0.0.1:4174/ntl-test/').replace(/\/?$/, '/');
+const reportName = new URL(baseURL).hostname === '127.0.0.1' ? 'production' : 'hosted';
 const browser=await chromium.launch({channel:'msedge',headless:true});
 try{
   const page=await browser.newPage({viewport:{width:1920,height:1080}}),errors=[],failures=[],remote=[];
   page.on('pageerror',e=>errors.push(e.message));page.on('response',r=>{if(r.status()>=400)failures.push([r.status(),r.url()]);});
-  page.on('request',r=>{if(/^https?:/.test(r.url())&&!r.url().startsWith('http://127.0.0.1:4174/ntl-test/'))remote.push(r.url());});
-  const start=performance.now();await page.goto('http://127.0.0.1:4174/ntl-test/');await page.waitForFunction(()=>window.ntlMap?.ready&&window.ntlApp);
+  page.on('request',r=>{if(/^https?:/.test(r.url())&&!r.url().startsWith(baseURL))remote.push(r.url());});
+  const start=performance.now();await page.goto(baseURL);await page.waitForFunction(()=>window.ntlMap?.ready&&window.ntlApp);
   const readyMs=performance.now()-start;
   await page.waitForFunction(()=>Number.isFinite(window.ntlMap.terrain(2048,2048)));
   const terrainArchipelago=await page.evaluate(()=>window.ntlMap.terrain(2048,2048));
@@ -34,9 +36,9 @@ try{
   const perf=await page.evaluate(()=>({heapBytes:performance.memory?.usedJSHeapSize,resources:performance.getEntriesByType('resource').length,layers:Object.keys(window.ntlMap.map._layers).length}));
   assert.deepEqual(errors,[]);assert.deepEqual(remote,[]);assert.deepEqual(failures,[]);
   mkdirSync('docs/verification',{recursive:true});
-  const report={basePath:'/ntl-test/',readyMs:Math.round(readyMs),maps:2,scenarioSelections:10,variants:4,iconFamilies:3,terrainArchipelago,terrainCity,...perf,errors,failedResources:failures,remoteRequests:remote};
-  writeFileSync('docs/verification/production-browser.json',JSON.stringify(report,null,2));
-  await page.screenshot({path:'docs/verification/production-desktop.png'});
-  await page.setViewportSize({width:390,height:844});await page.screenshot({path:'docs/verification/production-mobile.png'});
+  const report={url:baseURL,basePath:new URL(baseURL).pathname,readyMs:Math.round(readyMs),maps:2,scenarioSelections:10,variants:4,iconFamilies:3,terrainArchipelago,terrainCity,...perf,errors,failedResources:failures,remoteRequests:remote};
+  writeFileSync(`docs/verification/${reportName}-browser.json`,JSON.stringify(report,null,2));
+  await page.screenshot({path:`docs/verification/${reportName}-desktop.png`});
+  await page.setViewportSize({width:390,height:844});await page.screenshot({path:`docs/verification/${reportName}-mobile.png`});
   console.log(report);
 }finally{await browser.close();}

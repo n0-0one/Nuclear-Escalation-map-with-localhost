@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "Receive nearby-map frames, announce readiness, move and close the companion window. No telemetry or filesystem access.",
+  "windows": ["overlay"],
+  "permissions": [
+    "allow-close-overlay",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "core:event:allow-emit-to",
+    "core:window:allow-start-dragging"
+  ]
+}

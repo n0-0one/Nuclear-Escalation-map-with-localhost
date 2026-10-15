@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/majorlier/nuclear-thunder-interactive-map",
+  "commit": "d3b9854ed3fa065324840c2b8e7f1324837e86da",
+  "reference_branch": "automation/datamine-update",
+  "reference_branch_commit": "7ae7a517bc3e883b2f3e3989d864f93804c7fac8",
+  "note": "Reviewed extractor files copied unchanged from tools/. The referenced automation branch changes only generated data; its generator is identical. Future extractor updates require explicit review and refreshed hashes.",
+  "files": {
+    "build_map_data.py": "e2d50158143cc9361c120970e6f16c2426c7b232fba3664f4ece4fbe7184fe4a",
+    "datamine_sources.json": "8cf0dfbd0fdea005accd7c133211a12b6ea21d4f57216da789934da99098453f",
+    "extract_display_names.py": "f4f283435d21f8e843233b223bd563867c5149d979e2e4078ecf193470675e35",
+    "extract_mission_logic.py": "e70acc89f82f90da9945bd29e6ce6ace246eee8777903f1ff2a0eec03b44c892",
+    "extract_unit_specs.py": "c5c3bb8472f2239c36174630f0236fb38d0ff30dd3fa3f563ca614c7a53f13ff",
+    "layouts.json": "d2e5746cbc07877b03959467da34ca688e836391eded21c2e074471fad4a133f",
+    "test_mission_extraction.py": "9cc267af0db2224e0e98a6fe5670c712e4b4c9f6541337a0f9990d0e74251d2b",
+    "update_from_datamine.py": "e6ad05d0c574d19d34828093d334de9db48ecfdd851cadeaa6bd8788e67a31d9"
+  },
+  "content_normalization": "SHA-256 after CRLF-to-LF normalization"
+}

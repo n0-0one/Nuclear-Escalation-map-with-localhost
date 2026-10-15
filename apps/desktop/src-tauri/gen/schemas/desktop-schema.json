@@ -177,6 +177,78 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the close_overlay command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-close-overlay",
+          "markdownDescription": "Enables the close_overlay command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the configure_overlay command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-configure-overlay",
+          "markdownDescription": "Enables the configure_overlay command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the export_json command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-export-json",
+          "markdownDescription": "Enables the export_json command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the native_smoke_complete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-native-smoke-complete",
+          "markdownDescription": "Enables the native_smoke_complete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_overlay command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-overlay",
+          "markdownDescription": "Enables the open_overlay command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the telemetry_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-telemetry-snapshot",
+          "markdownDescription": "Enables the telemetry_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the close_overlay command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-close-overlay",
+          "markdownDescription": "Denies the close_overlay command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the configure_overlay command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-configure-overlay",
+          "markdownDescription": "Denies the configure_overlay command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the export_json command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-export-json",
+          "markdownDescription": "Denies the export_json command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the native_smoke_complete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-native-smoke-complete",
+          "markdownDescription": "Denies the native_smoke_complete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_overlay command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-overlay",
+          "markdownDescription": "Denies the open_overlay command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the telemetry_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-telemetry-snapshot",
+          "markdownDescription": "Denies the telemetry_snapshot command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

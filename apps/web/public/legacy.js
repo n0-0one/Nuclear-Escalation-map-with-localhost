@@ -1,4 +1,6 @@
 const ntlUnitMarkers = new Map();
+let ntlPlayerTeam = 0;
+function ntlVisualTeam(team) { return ntlPlayerTeam && (team === 1 || team === 2) ? (team === ntlPlayerTeam ? 2 : 1) : 0; }
 
     const MAP_IMAGE = "map_4k.png";
     const TOPOGRAPHIC_IMAGE = "topographic_map.webp";
@@ -1805,7 +1807,7 @@ const ntlUnitMarkers = new Map();
             positions.push(positions[0]);
         }
 
-        const color = site.team === 1 ? "#fc8181" : site.team === 2 ? "#90cdf4" : "#cbd5e0";
+        const color = teamColor(site.team);
         const speed = route.speed == null ? "" : `<br>Stored speed: ${escapeHtml(route.speed)}`;
         L.polyline(positions, {
             color,
@@ -2373,7 +2375,7 @@ const ntlUnitMarkers = new Map();
     }
 
     function teamColor(team) {
-        return team === 1 ? "#e53e3e" : team === 2 ? "#4299e1" : "#a0aec0";
+        return ntlVisualTeam(team) === 1 ? "#ff4557" : ntlVisualTeam(team) === 2 ? "#69b8ff" : "#a0aec0";
     }
 
     function isGroundUnit(unit, site) {
@@ -2542,7 +2544,7 @@ const ntlUnitMarkers = new Map();
 
     function iconTeamFill(team, colorRole = "default") {
         const palette = ICON_TEAM_PALETTES[colorRole] || ICON_TEAM_PALETTES.default;
-        return palette[team] || "#fdfcff";
+        return palette[ntlVisualTeam(team)] || "#a0aec0";
     }
 
     function vectorIconDataUri(team, family, path, colorRole = "default") {
@@ -2597,7 +2599,7 @@ const ntlUnitMarkers = new Map();
         } else if (family === "pact") {
             path = `images/icons/pact/def_ussr_${type}${suffix}.svg`;
         } else {
-            const side = team === 1 ? "enemy" : "ally";
+            const side = ntlVisualTeam(team) === 1 ? "enemy" : "ally";
             path = `images/icons/nato/def_nato_${side}_${type}${suffix}.svg`;
         }
         const vectorSource = vectorIconDataUri(
@@ -5015,6 +5017,16 @@ window.ntlMap = {
     variants() { return globalMapVariants; },
     definitions: MAP_DEFINITIONS,
     presets() { return globalPresetData.presets; },
+    playerTeam() { return ntlPlayerTeam; },
+    setPlayerTeam(team) {
+        const value = team === 1 || team === 2 ? team : 0;
+        if (ntlPlayerTeam === value) return;
+        ntlPlayerTeam = value;
+        document.documentElement.dataset.playerTeam = String(value);
+        document.documentElement.style.setProperty('--ntl-team-1', teamColor(1));
+        document.documentElement.style.setProperty('--ntl-team-2', teamColor(2));
+        if (globalSiteData.length) { renderMapData(selectedPresetId()); window.dispatchEvent(new Event('ntl:context')); }
+    },
     mission() { return globalMissionLogic; },
     roads() { return globalRoadDataByMap[currentMapId] || []; },
     convoyRoutes() {

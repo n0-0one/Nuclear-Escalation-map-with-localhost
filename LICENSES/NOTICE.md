@@ -1,10 +1,14 @@
 # Attribution and provenance
 
-Nuclear Thunder Live contains a modified local snapshot of **Nuclear Thunder Interactive Map**, by majorlier:
-https://github.com/majorlier/nuclear-thunder-interactive-map
-Snapshot commit: `d3b9854ed3fa065324840c2b8e7f1324837e86da`, imported 2026-10-14.
+Nuclear Thunder Live uses the map, map interface and extracted mission resources from **Nuclear Thunder Interactive Map**, created by **majorlier**:
 
-The user reports the author's permission to reuse and modify the project, obtained through Discord. That conversation was not supplied to this checkout. No standalone LICENSE file was present in the imported repository. This project does not invent a permissive license for that source or for game assets. Preserve the permission evidence with release records. The original README is retained in `UPSTREAM-README.md`.
+- Original interactive map: https://majorlier.github.io/nuclear-thunder-interactive-map/
+- Source code and documentation: https://github.com/majorlier/nuclear-thunder-interactive-map
+- Upstream data update branch: https://github.com/majorlier/nuclear-thunder-interactive-map/tree/automation/datamine-update
+
+The initial local snapshot was commit `d3b9854ed3fa065324840c2b8e7f1324837e86da`, imported 2026-10-14. Later imports record their source revisions with the generated data. Nuclear Thunder Live adds the local telemetry connection, battle state tools, settings and desktop integration; authorship of the original map remains with majorlier.
+
+No standalone LICENSE file was present in the initial imported repository. This attribution notice does not change the license or ownership of upstream material. The original README is retained in `UPSTREAM-README.md`; consult the original repository for its current notices and terms.
 
 Map images, icons, vehicle artwork, mission data, terrain and extracted game data retain their respective ownership, including Gaijin Entertainment. No affiliation or endorsement is claimed. Source provenance is in the bundled `datamine-lock.json`, generated metadata and original README.
 

@@ -1,75 +1,87 @@
 # Nuclear Thunder Live
 
-Samodzielna mapa Nuclear Escalation dla War Thunder: strona statyczna oraz aplikacja Windows 11 z frontendem dołączonym do EXE. Zachowuje narzędzia i dane mapy majorliera, dodając lokalną telemetrię, stany komponentów, planowanie lotu i historię bitwy.
+A standalone Nuclear Escalation map for War Thunder, available as a static website and a Windows application. It builds on **[Nuclear Thunder Interactive Map by majorlier](https://github.com/majorlier/nuclear-thunder-interactive-map)** and preserves the original map data, terrain, layers, icons and planning tools. Live adds local game telemetry, moving contacts, battle notes, route planning and a desktop companion minimap.
 
-**Wersja 0.1.0 — działający build do testów w grze.** Ograniczenia API są jawne: scenariusz, układ stron i afiliację wybiera użytkownik. Zniknięcie pojazdu nie oznacza zniszczenia. Repozytorium docelowe: [n0-0one/Nuclear-Escalation-map-with-localhost](https://github.com/n0-0one/Nuclear-Escalation-map-with-localhost).
+**Original project:** [majorlier's interactive map](https://majorlier.github.io/nuclear-thunder-interactive-map/) · [source and documentation](https://github.com/majorlier/nuclear-thunder-interactive-map). Attribution and third-party notices are in [LICENSES/NOTICE.md](LICENSES/NOTICE.md). This is an independent community project and is not affiliated with Gaijin Entertainment.
 
-## Uruchomienie Windows
+This is a field-test build. The local API does not reliably identify the current BR bracket, every vehicle, or every destruction event. Unknown data stays unknown and manual corrections remain available. See [the 0.2.0 verification record](docs/acceptance-0.2.0.md) for live, replay, synthetic and native evidence. The [0.1.0 record](docs/acceptance.md) is historical.
 
-Gotowe pliki po buildzie:
+## Start on Windows
 
-- `target/release/bundle/nsis/Nuclear Thunder Live_0.1.0_x64-setup.exe` — instalator x64.
-- `target/release/ntl-desktop.exe` — samodzielna aplikacja z mapami osadzonymi w EXE.
-- `target/release/ntl-bridge.exe` — opcjonalny mostek dla przeglądarki.
+Download the Windows package or installer from [the Windows app repository's releases](https://github.com/n0-0one/Nuclear-Escalation-map-with-localhost-app/releases). Extract the complete ZIP, then run `Nuclear-Thunder-Live.exe`, or run `Nuclear-Thunder-Live-Setup.exe` to install it. Microsoft Edge WebView2 Runtime is required and is usually already present on Windows 11. The installer can download WebView2 if it is missing. Releases are not signed with a publisher certificate.
 
-Przygotowane wydanie znajduje się również w `release/0.1.0/`: `Nuclear-Thunder-Live-Setup.exe`, `Nuclear-Thunder-Live.exe`, paczki Windows/Web/Source ZIP oraz `SHA256SUMS.txt`. Paczka Windows zawiera program, opcjonalny mostek, dokumentację i informacje o licencjach. Paczka Web zawiera gotowy katalog `dist/`.
+The map and its assets are bundled with the application. **Native War Thunder** connects directly to the game running on this computer. The map also works when the game is closed. The desktop application does not need the optional bridge.
 
-Uruchom instalator lub bezpośrednio aplikację. Potrzebny jest Microsoft Edge WebView2 Runtime (standardowo obecny w Windows 11). Instalator może pobrać runtime, jeśli go brakuje. Sama mapa i kolejne uruchomienia aplikacji nie wymagają połączenia z oryginalną stroną ani z internetem. Wydanie nie jest podpisane certyfikatem wydawcy.
+Local build outputs are `target/release/ntl-desktop.exe`, `target/release/bundle/nsis/Nuclear Thunder Live_<version>_x64-setup.exe` and `target/release/ntl-bridge.exe`. Packaged releases are written to `release/<version>/`, including Windows, Web and Source ZIP files and `SHA256SUMS.txt`.
 
-W aplikacji Windows tryb **Native War Thunder** automatycznie sprawdza lokalną grę. Gdy gra jest zamknięta, wszystkie narzędzia mapy pozostają dostępne. Nie uruchamiaj mostka dla aplikacji desktopowej.
+## Use the map
 
-## Korzystanie z mapy
+1. Choose **Archipelago** or **South Eastern City**, the battle's BR bracket and the correct side layout. Keep manual selection available when the game does not provide enough evidence to detect a setting.
+2. Use the original layers panel to show units, weapon ranges, terrain and roads. The original Measure, Line of sight, Flight brush and Threat cover tools are still available.
+3. Open **Battle controls** for the live connection, selected target, vehicle routes, battle history and settings. Collapse it when you want more room for the map.
+4. Select a site or search for it to inspect its components. Record a radar, launcher, vehicle or building as destroyed only when you have evidence. **Undo** reverses a manual change.
+5. Use target focus and the previous-view control to move between a selected contact and your earlier map position. Use route controls to inspect a route without losing the map context.
+6. Create a planned flight with 2–12 points. Unknown threats are included by default. The result is an estimate, not a guarantee of safe terrain clearance or concealment.
 
-1. W lewym panelu wybierz Archipelago lub South Eastern City, scenariusz i ewentualnie **Swap sides**.
-2. Oryginalny prawy panel udostępnia warstwy, teren, drogi, jednostki, zasięgi i legendę. Na dole po lewej są Measure, Line of sight, Flight brush i Threat cover.
-3. **Live panel** otwiera panel połączenia, stany komponentów, konwoje, planer i historię. Można go zwinąć, aby odsłonić oryginalne warstwy.
-4. Kliknij pozycję lub wyszukaj ją w Target & component states. Osobno oznaczaj radary, wyrzutnie, czołgi, SPAA i budynki. **Undo** cofa ręczną zmianę. Focus target i Previous view sterują widokiem.
-5. Dopiero po wybraniu właściwego scenariusza i stron zaznacz **I selected the correct scenario and side layout**, aby dopuścić ostrożne dopasowanie obserwacji do statycznych komponentów. Wynik jest oznaczony INFERRED, nie jako pewna identyfikacja.
-6. Planer lotu przyjmuje 2–12 klikniętych punktów. Domyślnie uwzględnia również nieznane zagrożenia. Wynik jest estymacją; nie gwarantuje osłony terenu ani bezpiecznego przelotu.
+**Predicted** routes come from mission data. **Observed** movement comes from local telemetry, with inferred continuity rather than a guaranteed vehicle ID. **Simulated** means demonstration data; leaving demo mode removes its simulated battle state. Disappearing from telemetry does not by itself mean that a vehicle or airfield was destroyed.
 
-**PREDICTED** na trasie konwoju oznacza trasę wynikającą z misji. Turkusowa historia ruchu oznacza obserwowany anonimowy obiekt, bez potwierdzonej tożsamości konwoju. **SIMULATED** oznacza tryb demonstracyjny; wyjście z niego usuwa stany wygenerowane przez symulację.
+The live display uses player-relative contact information when it is available. A faction name such as NATO or USSR is not sufficient evidence that a contact is an enemy. Unsupported contacts and identities remain unknown instead of receiving a guessed team or aircraft role.
 
-Eksport historii zapisuje kontekst i stany bitwy jako JSON. Eksport diagnostyczny zawiera statusy, błędy i podstawowe metryki, bez kodu parowania i wiadomości HUD. W desktopie plik trafia do Pobranych, w przeglądarce używa zwykłego pobierania pliku.
+**Settings** controls update speed, marker size, trail length, smooth movement, aiming-point visibility and nuclear-aircraft highlights. Choose a slower update speed and shorter trails to reduce load. Yellow crosshairs show aiming points and a red diamond shows your point of interest when the game exposes them. The observed live API sample included a point of interest, but no yellow aiming-point records; parser support is not proof that every game mode reports those marks.
 
-## Strona lokalna
+Select an aircraft and choose **Mark this aircraft as nuclear (manual)** when you have confirmed its role yourself. Automatic nuclear highlighting requires an explicit nuclear identifier from the game. A generic aircraft marker or model alone does not establish that it is carrying a nuclear weapon. Manual labels remain identified as manual and are tied to an estimated track that can lose continuity.
 
-Wymagany Node.js 24. Z katalogu repozytorium:
+Battle detection tries to match enough distinct static units and runway geometry before changing a setting. If two BR presets share the same visible placements, the bracket stays ambiguous. Enter the battle's maximum BR yourself in that case; side-layout detection can continue independently. Your own aircraft's BR is not treated as the match's maximum BR.
+
+Battle export saves context, notes and states as JSON. Diagnostic export contains connection status, errors and basic metrics; it excludes pairing codes and HUD messages. The desktop writes a new timestamped file in Downloads. The website uses the browser's normal download flow.
+
+## Desktop companion minimap
+
+The desktop overlay is a small, resizable, always-on-top window showing nearby information from the main application. Open it from the main application's overlay controls. Move it by its header and resize it by its border. Click-through mode lets mouse input pass to the game; use the main window to switch click-through off or reopen the overlay when you want to move it again.
+
+Keep the main application running. It owns the single telemetry connection and passes map frames to the overlay. Closing the main window closes the overlay. Minimizing the main window does not close the overlay. Display opacity is applied by the frontend; it does not change the game window.
+
+Use windowed or borderless game mode. An ordinary desktop companion window is not guaranteed to appear above exclusive fullscreen games. This feature does not inject into War Thunder, read game memory, register global keyboard hooks or bypass anti-cheat. A website cannot create a native always-on-top game overlay; the desktop application is required for that window behavior. See [the overlay contract](docs/overlay.md).
+
+## Run the website locally
+
+Install Node.js 24, then run these commands from the repository directory:
 
 ```powershell
 npm ci
 npm run dev
 ```
 
-Otwórz `http://127.0.0.1:5173`. Build produkcyjny:
+Open `http://127.0.0.1:5173`. To build and preview the production website:
 
 ```powershell
 npm run build
 npm run preview
 ```
 
-Podgląd: `http://127.0.0.1:4173`. Nie otwieraj `index.html` przez `file://`; przeglądarki blokują wówczas odczyt danych JSON. Gotowy `dist/` można serwować dowolnym serwerem statycznym. Wszystkie potrzebne pliki znajdują się w tym katalogu; nie trzeba pobierać źródeł majorliera.
+Open `http://127.0.0.1:4173`. Serve the generated `dist/` directory with any static HTTP server. Do not open `index.html` through `file://`, because browser restrictions prevent the map's JSON data from loading that way. All map assets are local to the build; the original project does not need to be running or downloaded at runtime.
 
-## Połączenie przeglądarki z grą
+## Connect the website to War Thunder
 
-**Manual / offline** działa zawsze. **Direct localhost** próbuje czytać `127.0.0.1:8111`; dostęp zależy od zasad przeglądarki i CORS gry. Przy blokadzie wybierz mostek lub desktop. Nie wyłączaj zabezpieczeń przeglądarki.
+**Manual / offline** is always available. **Direct localhost** tries the game's `127.0.0.1:8111` API; whether it succeeds depends on game CORS and browser local-network rules. If the connection is blocked, use the local bridge or the desktop application. Do not disable browser protections.
 
-Mostek lokalny:
+Start the optional bridge:
 
 ```powershell
 .\target\release\ntl-bridge.exe
 ```
 
-W panelu strony wybierz **Local bridge**, wklej kod parowania wydrukowany w konsoli mostka i naciśnij **Connect**. Kod jest losowy i zmienia się po każdym uruchomieniu. Mostek akceptuje domyślnie wyłącznie lokalne originy podglądu na portach 5173 i 4173. Dla GitHub Pages uruchom:
+Select **Local bridge** on the website, paste the pairing code printed in the bridge's console and connect. A new random code is generated each time the bridge starts. By default, it accepts only the local preview origins on ports 5173 and 4173. For the GitHub Pages website, use:
 
 ```powershell
 .\target\release\ntl-bridge.exe --origin https://n0-0one.github.io
 ```
 
-Origin nie zawiera ścieżki repozytorium ani końcowego ukośnika. Mostek nasłuchuje wyłącznie `127.0.0.1:8112`. Ctrl+C go zatrzymuje. Każdy odwiedzający uruchamia własną grę i własny mostek. Hosting nie otrzymuje telemetrii. Przeglądarka może poprosić o dostęp do sieci lokalnej; jeśli nie obsługuje tego połączenia, aplikacja Windows pozostaje niezależną ścieżką.
+The origin must not include a repository path or trailing slash. The bridge listens only on `127.0.0.1:8112`; press Ctrl+C to stop it. Each visitor connects to their own game and their own bridge. Telemetry is not uploaded to the website host. A browser may ask for local-network access; if that connection is unsupported, use the desktop application.
 
-## Budowanie Windows
+## Build for Windows
 
-Wymagane: Node.js 24, Rust stable MSVC, Visual Studio C++ Build Tools z Windows SDK oraz WebView2. Zależności są przypięte w lockfile'ach.
+Requirements: Node.js 24, Rust stable with the MSVC target, Visual Studio C++ Build Tools with a Windows SDK, and WebView2. Dependency versions are recorded in the lockfiles.
 
 ```powershell
 npm ci
@@ -77,26 +89,28 @@ npm run desktop:build
 cargo build --locked --release -p ntl-bridge
 ```
 
-`desktop:build` buduje frontend, uruchamia Tauri z production custom protocol i generuje instalator NSIS. Pierwszy build pobiera pakiety oraz narzędzia NSIS. Nie zastępuj go samym `cargo build --release` bez feature `custom-protocol`, ponieważ build deweloperski wskazuje serwer Vite.
+`desktop:build` builds the frontend, enables Tauri's production custom protocol and generates the NSIS installer. The first build downloads dependencies and NSIS tools. A plain `cargo build --release` without `custom-protocol` is a development build that expects Vite; it is not a standalone release.
 
-Alternatywnie, EXE bez pakowania instalatora:
+To build only the standalone EXE:
 
 ```powershell
 npm run build
 cargo build --locked --release -p ntl-desktop --features custom-protocol
 ```
 
-Development: uruchom `npm run dev` w pierwszym terminalu i `npm run desktop:dev` w drugim. Zamykanie natywnego okna kończy proces; aplikacja nie uruchamia żadnego ukrytego mostka.
+For development, run `npm run dev` in one terminal and `npm run desktop:dev` in another. Closing the main native window exits the application and its companion window. No hidden bridge process is started.
 
-## GitHub Pages i wydania
+## Hosting, releases and data updates
 
-Workflow `.github/workflows/pages.yml` buduje i waliduje stronę, a następnie publikuje `dist`. W ustawieniach repozytorium wybierz **Pages → Source → GitHub Actions**. Push do `main` lub ręczne uruchomienie workflow rozpoczyna publikację. Własna domena może zostać ustawiona w Pages; relatywne ścieżki assetów obsługują także domenę główną.
+The website repository is [n0-0one/Nuclear-Escalation-map-with-localhost](https://github.com/n0-0one/Nuclear-Escalation-map-with-localhost). The Windows app repository is [n0-0one/Nuclear-Escalation-map-with-localhost-app](https://github.com/n0-0one/Nuclear-Escalation-map-with-localhost-app). The Pages address is [Nuclear Thunder Live](https://n0-0one.github.io/Nuclear-Escalation-map-with-localhost/). Check the repository's latest workflow run for the deployed revision.
 
-Adres docelowy po udanym wdrożeniu: `https://n0-0one.github.io/Nuclear-Escalation-map-with-localhost/`. Sam zapis tego adresu w README nie oznacza, że strona została już wdrożona. Prywatne repozytorium musi mieć plan GitHub obsługujący Pages; nie zmieniaj jego widoczności bez decyzji właściciela.
+`.github/workflows/pages.yml` builds and validates the website, then deploys `dist/`. Configure **Settings → Pages → Source → GitHub Actions**. A push to `main` or manual workflow run starts deployment. Relative asset paths support both repository subpaths and custom domains.
 
-`.github/workflows/windows.yml` tworzy EXE i instalator na `windows-latest`, po ręcznym uruchomieniu lub tagu `v*`. Pliki pojawiają się jako artifact Nuclear-Thunder-Live-Windows. Workflow nie tworzy automatycznie publicznego GitHub Release.
+`.github/workflows/windows.yml` builds the Windows application and installer on `windows-latest`. Its artifacts contain the application, installer and third-party notices. Only a successful release workflow establishes that downloadable binaries were published; source commits alone do not.
 
-## Testy
+Map updates follow the upstream project's generated data and preserve source attribution. See [the datamine update process](docs/datamine.md) for the automation branch, review rules and pinned source revisions. Changes to generated data should be reviewed and tested before they reach the published application or website.
+
+## Verify and package a build
 
 ```powershell
 npm test
@@ -106,21 +120,21 @@ cargo test --locked -p war-thunder-telemetry -p ntl-bridge
 node tests/integration/bridge-security.mjs
 ```
 
-Testy przeglądarkowe używają zainstalowanego Microsoft Edge. Test rzeczywistej gry z mostkiem: uruchom Vite i `node tests/integration/bridge-security.mjs --browser` podczas bitwy. Test uruchamia własny mostek i kończy go po wykonaniu; port 8112 musi być wolny. Wynik zapisuje w `docs/verification/` i nie wysyła go do sieci.
+Browser tests use Microsoft Edge. For a real-game browser check, start Vite and run `node tests/integration/bridge-security.mjs --browser` during a battle. It starts its own bridge and stops it afterward, so port 8112 must be available. Reports stay in ignored `docs/verification/` and are not uploaded.
 
-Test produkcyjnego podkatalogu: uruchom `node scripts/serve-build.mjs`, a następnie `node tests/integration/production-browser.mjs`. To sprawdza `/ntl-test/`, obie mapy, scenariusze, style ikon i brak zewnętrznych zasobów.
+For the production subpath check, start `node scripts/serve-build.mjs`, then run `node tests/integration/production-browser.mjs`. It checks `/ntl-test/`, both maps, scenario switching, icon families and local resource loading.
 
-Test natywnego EXE bez Vite: `./tests/integration/native-smoke.ps1`. Skrypt uruchamia ukrytą instancję, sprawdza osadzoną mapę i natywny odczyt telemetrii, zapisuje lokalny raport i kończy proces testowy. Brak uruchomionej gry nie blokuje testu mapy.
+For a native check without Vite, run `./tests/integration/native-smoke.ps1`. It starts a hidden instance, checks embedded map loading and the native telemetry call, writes a local report and exits the test process. The game does not need to be running for map checks to pass. It does not close an existing user window.
 
-Pakowanie po zbudowaniu Windows, mostka i strony oraz dodaniu źródeł do Git: `python scripts/package-release.py`. Opcja `--desktop-dir target/final/release` wskazuje alternatywny katalog builda. Skrypt pakuje tylko śledzone źródła; lokalne przechwycenia telemetrii i raporty nie trafiają do archiwum źródłowego.
+After building the website, desktop and bridge, and adding sources to Git, run `python scripts/package-release.py`. Use `--desktop-dir target/final/release` for an alternative build directory. Only Git-tracked source files enter the source archive; live telemetry captures and local reports are excluded.
 
-## Dokumentacja
+## Documentation
 
-- [Architektura](docs/architecture.md)
-- [Telemetria i semantyka pewności](docs/telemetry.md)
-- [Dane map](docs/map-data.md)
-- [Ograniczenia](docs/limitations.md)
-- [Wyniki odbioru](docs/acceptance.md)
-- [Pochodzenie i licencje](LICENSES/NOTICE.md)
-
-Original map: [majorlier/nuclear-thunder-interactive-map](https://github.com/majorlier/nuclear-thunder-interactive-map), commit `d3b9854ed3fa065324840c2b8e7f1324837e86da`. Autorstwo i prawa do materiałów gry zostały zachowane. Projekt nie jest powiązany z Gaijin Entertainment.
+- [Architecture](docs/architecture.md)
+- [Telemetry and confidence](docs/telemetry.md)
+- [Map data and provenance](docs/map-data.md)
+- [Desktop companion overlay](docs/overlay.md)
+- [Data update process](docs/datamine.md)
+- [Known limitations](docs/limitations.md)
+- [Verification record](docs/acceptance.md)
+- [Attribution and third-party notices](LICENSES/NOTICE.md)

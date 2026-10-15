@@ -1,0 +1,1001 @@
+import argparse
+import glob
+import json
+import os
+from collections import Counter
+
+
+BUILDING_SLOT_TYPES = {"ammo_storage", "fuel_storage"}
+
+
+def load_json(filepath):
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as source:
+        try:
+            return json.load(source)
+        except json.JSONDecodeError as exc:
+            print(f"[!] Skipping {os.path.basename(filepath)}: {exc}")
+            return None
+
+
+def is_matrix(value):
+    return (
+        isinstance(value, list)
+        and len(value) >= 4
+        and all(isinstance(row, list) and len(row) >= 3 for row in value[:4])
+        and all(isinstance(number, (int, float)) for row in value[:4] for number in row[:3])
+    )
+
+
+def transform_local_to_world(site_tm, local_pos):
+    r0, r1, r2, center = site_tm[0], site_tm[1], site_tm[2], site_tm[3]
+    lx, ly, lz = local_pos
+    return [
+        center[0] + lx * r0[0] + ly * r1[0] + lz * r2[0],
+        center[1] + lx * r0[1] + ly * r1[1] + lz * r2[1],
+        center[2] + lx * r0[2] + ly * r1[2] + lz * r2[2],
+    ]
+
+
+def position_key(position):
+    return tuple(round(float(value), 5) for value in position[:3])
+
+
+def build_layout(data):
+    slots = []
+    seen_positions = set()
+
+    def add_slot(slot_type, matrix, source):
+        if not is_matrix(matrix):
+            return
+        local_pos = matrix[3][:3]
+        key = position_key(local_pos)
+        if key in seen_positions:
+            return
+        seen_positions.add(key)
+        slots.append(
+            {
+                "slot_type": str(slot_type).lower(),
+                "tm": matrix,
+                "local_pos": local_pos,
+                "source": source,
+            }
+        )
+
+    # ECS spawn positions are authoritative. The matching #position nodes found
+    # in several layouts are editor representations of these same slots.
+    ecs_spawns = data.get("ecsUnitSpawnPositions", {})
+    if isinstance(ecs_spawns, dict):
+        for slot_type, spawn_data in ecs_spawns.items():
+            if is_matrix(spawn_data):
+                add_slot(slot_type, spawn_data, "ecsUnitSpawnPositions")
+            elif isinstance(spawn_data, list):
+                for matrix in spawn_data:
+                    add_slot(slot_type, matrix, "ecsUnitSpawnPositions")
+
+    raw_nodes = data.get("node", [])
+    if isinstance(raw_nodes, dict):
+        raw_nodes = [raw_nodes]
+    if isinstance(raw_nodes, list):
+        for node in raw_nodes:
+            if not isinstance(node, dict):
+                continue
+            node_type = node.get("type")
+            if node_type:
+                add_slot(node_type, node.get("tm"), "node")
+
+    runway = None
+    airfield = data.get("airfield")
+    if isinstance(airfield, dict) and "start" in airfield and "end" in airfield:
+        runway = {
+            "start": airfield["start"],
+            "end": airfield["end"],
+            "width": airfield.get("width", 80.0),
+        }
+
+    if not slots and not runway:
+        return None
+    return {"slots": slots, "runway": runway}
+
+
+def iter_dict_items(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield key, child
+            yield from iter_dict_items(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_dict_items(child)
+
+
+class TemplateRegistry:
+    def __init__(self, definitions):
+        self.definitions = definitions
+
+    def components(self, template_name):
+        if not isinstance(template_name, str):
+            return []
+        return [part for part in template_name.split("+") if part in self.definitions]
+
+    def closure(self, template_names):
+        ordered = []
+        visited = set()
+
+        def visit(template_name):
+            for component in self.components(template_name):
+                if component in visited:
+                    continue
+                visited.add(component)
+                definition = self.definitions[component]
+                bases = definition.get("_use", [])
+                if isinstance(bases, str):
+                    bases = [bases]
+                if isinstance(bases, list):
+                    for base in bases:
+                        visit(base)
+                ordered.append((component, definition))
+
+                # Assembly areas point at their era-specific tank-factory
+                # template indirectly; that factory owns the three SPAA units.
+                for key, value in iter_dict_items(definition):
+                    if isinstance(value, str) and key.endswith("Templ"):
+                        visit(value)
+
+        for name in template_names:
+            visit(name)
+        return ordered
+
+    def unit_settings(self, template_names, team):
+        settings = []
+        seen = set()
+        for preset_name, definition in self.closure(template_names):
+            for key, value in iter_dict_items(definition):
+                is_spawn_settings = (
+                    key.startswith("units_spawn_on_init__unitSettings")
+                    or key == "sam_site__unitSettings:array"
+                )
+                if not is_spawn_settings:
+                    continue
+                if "Team1" in key and team != 1:
+                    continue
+                if "Team2" in key and team != 2:
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                units = value.get("unit:object", [])
+                if isinstance(units, dict):
+                    units = [units]
+                if not isinstance(units, list):
+                    continue
+                for unit in units:
+                    if not isinstance(unit, dict) or not unit.get("name"):
+                        continue
+                    signature = json.dumps(unit, sort_keys=True)
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    copied = dict(unit)
+                    copied["_preset"] = preset_name
+                    settings.append(copied)
+        return settings
+
+    def find_values(self, template_names, wanted_keys):
+        values = {}
+        for _, definition in self.closure(template_names):
+            for key, value in iter_dict_items(definition):
+                if key in wanted_keys:
+                    values[key] = value
+        return values
+
+
+def config_is_active(config, rank):
+    if not isinstance(config, dict):
+        return True
+    rank_range = config.get("rankRange")
+    if not isinstance(rank_range, list) or len(rank_range) < 2:
+        return True
+    return rank_range[0] <= rank <= rank_range[1]
+
+
+def active_templates(site, rank):
+    active = []
+    configs = []
+    additional = site.get("additionalEcsTemplates", {})
+    if not isinstance(additional, dict):
+        return active, configs
+
+    for template_name, value in additional.items():
+        variants = value if isinstance(value, list) else [value]
+        for variant in variants:
+            if config_is_active(variant, rank):
+                active.append(template_name)
+                configs.append(variant if isinstance(variant, dict) else {})
+    return active, configs
+
+
+def mission_site_category(site, registry):
+    """Classify gameplay sites by inherited ECS components, not mesh names."""
+    templates = site.get("additionalEcsTemplates", {})
+    closure = registry.closure(templates)
+    components = {name for name, _ in closure}
+    # Fuel/ammunition factories identify their role with typed ECS tags,
+    # whereas assembly areas/airfields use named base templates.
+    components.update(
+        key.split(":", 1)[0]
+        for _, definition in closure
+        for key, _ in iter_dict_items(definition)
+        if key.endswith(":tag")
+    )
+    for component, category in (
+        ("assembly_area", "assembly_area"),
+        ("fuel_factory", "fuel_factory"),
+        ("ammo_factory", "ammo_factory"),
+        ("strongpoint", "strongpoint"),
+        ("nuclear_escalation_airfield", "airfield"),
+    ):
+        if component in components:
+            return category
+    return None
+
+
+def import_document_name(import_record):
+    """Translate a mission import path into the downloaded input filename."""
+    path = import_record.get("file", "") if isinstance(import_record, dict) else ""
+    return os.path.splitext(os.path.basename(path))[0].lower()
+
+
+def imported_mission_units(document, documents, rank):
+    """Resolve rank-selected mission imports that contribute concrete units.
+
+    Nuclear Escalation now keeps the era-specific ship definitions in imported
+    files.  The mission still owns each ship's patrol waypoints, so imports are
+    resolved here instead of treating their zero-coordinate editor placeholders
+    as real positions.
+    """
+    imported = []
+    visited = set()
+
+    def visit(current, include_units=False):
+        if not isinstance(current, dict):
+            return
+        marker = id(current)
+        if marker in visited:
+            return
+        visited.add(marker)
+
+        if include_units:
+            units = current.get("units", {})
+            if isinstance(units, dict):
+                for source_group, group_units in units.items():
+                    if not isinstance(group_units, list):
+                        continue
+                    for unit in group_units:
+                        if isinstance(unit, dict) and unit.get("unit_class"):
+                            imported.append((source_group, dict(unit)))
+
+        imports = current.get("imports", {})
+        records = imports.get("import_record", []) if isinstance(imports, dict) else []
+        if isinstance(records, dict):
+            records = [records]
+        if not isinstance(records, list):
+            return
+        for record in records:
+            if not isinstance(record, dict) or not config_is_active(record, rank):
+                continue
+            child_name = import_document_name(record)
+            child = documents.get(child_name)
+            if child is None:
+                continue
+            # Event-specific fleet files may omit the legacy importUnits flag
+            # even though their units are the authoritative mission entries
+            # (the 2.59.0.7 carrier split is one example). Treat Nuclear
+            # Escalation imports as unit-bearing by path, while retaining the
+            # old flag for unrelated reusable mission libraries.
+            visit(
+                child,
+                include_units
+                or bool(record.get("importUnits"))
+                or "nuclear_escalation" in child_name.lower(),
+            )
+
+    visit(document)
+    return imported
+
+
+def ship_with_mission_route(site, mission):
+    """Attach the mission-owned route and a real initial location to a ship."""
+    if site.get("_source_group") != "ships" or site.get("way"):
+        return site
+    name = site.get("name", "")
+    waypoints = mission.get("wayPoints", {})
+    route = waypoints.get(f"{name}_waypoints") if isinstance(waypoints, dict) else None
+    if not isinstance(route, dict):
+        # Imported fleet templates deliberately use a zero transform.  A ship
+        # without its matching mission waypoint is a formation member whose
+        # actual placement is resolved in-game, so it must not become a marker
+        # at the centre of the web map.
+        return None
+    way = route.get("way", {})
+    if not isinstance(way, dict) or not way:
+        return None
+    first_waypoint = next(
+        (item for item in way.values() if isinstance(item, dict) and is_matrix(item.get("tm"))),
+        None,
+    )
+    if not first_waypoint:
+        return None
+    resolved = dict(site)
+    resolved["tm"] = first_waypoint["tm"]
+    resolved["way"] = way
+    resolved["closed_waypoints"] = bool(route.get("closed_waypoints"))
+    resolved["isShipSpline"] = bool(route.get("isShipSpline"))
+    resolved["shipTurnRadius"] = route.get("shipTurnRadius")
+    return resolved
+
+
+def rank_condition_allows(condition, rank):
+    """Evaluate one ``varCompareInt mission_rank`` trigger condition."""
+    if not isinstance(condition, dict) or condition.get("var_value") != "mission_rank":
+        return True
+    value = condition.get("value")
+    if not isinstance(value, (int, float)):
+        return True
+    comparison = str(condition.get("comparasion_func", "")).lower()
+    return {
+        "more": rank > value,
+        "less": rank < value,
+        "equal": rank == value,
+        "notequal": rank != value,
+        "moreequal": rank >= value,
+        "lessequal": rank <= value,
+    }.get(comparison, True)
+
+
+def unit_spawn_rank_rules(mission):
+    """Map each trigger-spawned unit to its trigger's mission_rank conditions.
+
+    For example ``spawn_mlrs`` only runs when ``mission_rank`` is more than
+    30, so MLRS launchers are absent from the 1970 presets.
+    """
+    rules = {}
+    triggers = mission.get("triggers", {})
+    if not isinstance(triggers, dict):
+        return rules
+    for trigger in triggers.values():
+        if not isinstance(trigger, dict):
+            continue
+        conditions = trigger.get("conditions", {})
+        compares = conditions.get("varCompareInt", []) if isinstance(conditions, dict) else []
+        if isinstance(compares, dict):
+            compares = [compares]
+        rank_conditions = [
+            item for item in compares
+            if isinstance(item, dict) and item.get("var_value") == "mission_rank"
+        ]
+        if not rank_conditions:
+            continue
+        actions = trigger.get("actions", {})
+        if not isinstance(actions, dict):
+            continue
+        for action_name in ("unitRespawn", "unitSpawnOnObjectGroup"):
+            entries = actions.get(action_name, [])
+            if isinstance(entries, dict):
+                entries = [entries]
+            for entry in entries if isinstance(entries, list) else []:
+                if isinstance(entry, dict) and isinstance(entry.get("object"), str):
+                    rules.setdefault(entry["object"], []).extend(rank_conditions)
+    return rules
+
+
+def spawned_at_rank(rank_rules, unit_name, rank):
+    return all(
+        rank_condition_allows(condition, rank)
+        for condition in rank_rules.get(unit_name, [])
+    )
+
+
+def mission_object_groups(mission):
+    units = mission.get("units", {})
+    if not isinstance(units, dict):
+        return []
+    return [
+        unit
+        for unit in units.get("objectGroups", [])
+        if isinstance(unit, dict)
+    ]
+
+
+def discover_presets(mission):
+    """Create non-overlapping scenario presets from the mission's rank ranges.
+
+    This deliberately does not assume that an event has 1970/1980/2018
+    presets. New boundaries in a future mission become new UI choices without
+    requiring a hand edit here.
+    """
+    ranges = []
+    for site in mission_object_groups(mission):
+        additional = site.get("additionalEcsTemplates", {})
+        if not isinstance(additional, dict):
+            continue
+        for value in additional.values():
+            variants = value if isinstance(value, list) else [value]
+            for variant in variants:
+                rank_range = (
+                    variant.get("rankRange")
+                    if isinstance(variant, dict)
+                    else None
+                )
+                if (
+                    isinstance(rank_range, list)
+                    and len(rank_range) >= 2
+                    and all(isinstance(value, int) for value in rank_range[:2])
+                ):
+                    ranges.append((rank_range[0], rank_range[1]))
+
+    if not ranges:
+        return [{"id": "rank-0-50", "label": "Rank 0–50", "rank": 0, "rank_range": [0, 50]}]
+
+    boundaries = sorted({point for start, end in ranges for point in (start, end + 1)})
+    presets = []
+    for start, next_start in zip(boundaries, boundaries[1:]):
+        end = next_start - 1
+        if not any(range_start <= start <= range_end for range_start, range_end in ranges):
+            continue
+        active_names = []
+        for site in mission_object_groups(mission):
+            names, _ = active_templates(site, start)
+            active_names.extend(names)
+        names_text = " ".join(active_names).lower()
+        year = next(
+            (value for value in ("1970", "1980", "2018") if value in names_text),
+            None,
+        )
+        phase = ""
+        if "early" in names_text:
+            phase = " Early"
+        elif "late" in names_text:
+            phase = " Late"
+        label = f"{year}{phase}" if year else f"Rank {start}–{end}"
+        presets.append(
+            {
+                "id": f"rank-{start}-{end}",
+                "label": label,
+                "rank": start,
+                "rank_range": [start, end],
+            }
+        )
+
+    # A later internal split can retain the same year name (for example the
+    # two current 2018 selections).  Keep the UI choices unambiguous without
+    # presenting the internal rank numbers as if they were BRs.
+    label_counts = Counter(preset["label"] for preset in presets)
+    label_indices = Counter()
+    for preset in presets:
+        label = preset["label"]
+        if label_counts[label] > 1:
+            label_indices[label] += 1
+            preset["label"] = f"{label} {label_indices[label]}"
+    return presets
+
+
+def role_for_unit(setting, slot_type):
+    spawn_name = str(setting.get("spawnName", "")).lower()
+    if spawn_name:
+        return spawn_name
+    if slot_type == "air_def":
+        return "spaa"
+    template_name = str(setting.get("templateName", "")).lower()
+    unit_name = str(setting.get("name", "")).lower()
+    if "radar" in unit_name:
+        return "radar"
+    if "spaa" in template_name:
+        return "spaa"
+    if "launcher" in unit_name:
+        return "launcher"
+    return "vehicle"
+
+
+def expand_settings(settings):
+    expanded = []
+    for setting in settings:
+        count = setting.get("count", 1)
+        try:
+            count = max(0, int(count))
+        except (TypeError, ValueError):
+            count = 1
+        for index in range(count):
+            item = dict(setting)
+            item["_number"] = index + 1
+            item["_count"] = count
+            expanded.append(item)
+    return expanded
+
+
+def lifecycle_for_unit(template_name, site, registry):
+    """Return the template-derived lifecycle for one placed mission unit.
+
+    This deliberately records only behavior inherited by the selected mission
+    template. Explicit mission triggers (MLRS, TBM, long-range radar squads)
+    remain in mission_logic.json and are joined by their exact object id in the
+    browser. That keeps gameplay facts source-backed and avoids name guesses.
+    """
+    components = {
+        name for name, _ in registry.closure([str(template_name or "")])
+    }
+    if "restore_unit_by_timer" not in components:
+        return {"kind": "none", "source": "template"}
+
+    if mission_site_category(site, registry) in {
+        "fuel_factory", "ammo_factory", "assembly_area"
+    }:
+        return {"kind": "repair_with_site", "source": "template"}
+    return {"kind": "restore", "source": "template"}
+
+
+def create_buildings(site, layout, template_names, inline_configs, registry):
+    buildings = []
+    used_slot_ids = set()
+    site_pos = site["tm"][3][:3]
+
+    for config in inline_configs:
+        unit_class = config.get("unit__className")
+        if unit_class:
+            buildings.append(
+                {
+                    "name": unit_class,
+                    "role": "building",
+                    "world_pos": site_pos,
+                    "local_pos": [0.0, 0.0, 0.0],
+                }
+            )
+
+    if mission_site_category(site, registry) == "assembly_area":
+        keys = {
+            "assembly_area__tankFactoryUnitName",
+            "assembly_area__fuelStorageUnitName",
+            "assembly_area__ammoStorageUnitName",
+        }
+        names = registry.find_values(template_names, keys)
+        main_name = names.get("assembly_area__tankFactoryUnitName")
+        if main_name:
+            buildings.append(
+                {
+                    "name": main_name,
+                    "role": "building",
+                    "world_pos": site_pos,
+                    "local_pos": [0.0, 0.0, 0.0],
+                }
+            )
+
+        slot_names = {
+            "fuel_storage": names.get("assembly_area__fuelStorageUnitName"),
+            "ammo_storage": names.get("assembly_area__ammoStorageUnitName"),
+        }
+        for index, slot in enumerate(layout.get("slots", [])):
+            building_name = slot_names.get(slot["slot_type"])
+            if not building_name:
+                continue
+            used_slot_ids.add(index)
+            buildings.append(
+                {
+                    "name": building_name,
+                    "role": "building",
+                    "world_pos": transform_local_to_world(site["tm"], slot["local_pos"]),
+                    "local_pos": slot["local_pos"],
+                }
+            )
+
+    return buildings, used_slot_ids
+
+
+def place_spawned_units(site, layout, settings, used_slot_ids, registry):
+    slots = layout.get("slots", [])
+    available = [
+        (index, slot)
+        for index, slot in enumerate(slots)
+        if index not in used_slot_ids and slot["slot_type"] not in BUILDING_SLOT_TYPES
+    ]
+    occupied = set()
+    placed = []
+
+    for setting in expand_settings(settings):
+        desired = str(setting.get("spawnName", "")).lower()
+        candidates = []
+        if desired:
+            candidates = [
+                (index, slot)
+                for index, slot in available
+                if index not in occupied and slot["slot_type"] == desired
+            ]
+        else:
+            candidates = [(index, slot) for index, slot in available if index not in occupied]
+
+        slot_index = None
+        slot = None
+        if candidates:
+            slot_index, slot = candidates[0]
+            occupied.add(slot_index)
+
+        local_pos = slot["local_pos"] if slot else [0.0, 0.0, 0.0]
+        world_pos = (
+            transform_local_to_world(site["tm"], local_pos)
+            if slot
+            else site["tm"][3][:3]
+        )
+        slot_type = slot["slot_type"] if slot else "origin"
+        placed.append(
+            {
+                "name": setting["name"],
+                "role": role_for_unit(setting, slot_type),
+                "slot_type": slot_type,
+                "preset": setting.get("_preset", ""),
+                "world_pos": world_pos,
+                "local_pos": local_pos,
+                "number": setting.get("_number", 1),
+                "count": setting.get("_count", 1),
+                "threat_range": setting.get("threatSearchRad"),
+                "template": setting.get("templateName", ""),
+                "lifecycle": lifecycle_for_unit(
+                    setting.get("templateName", ""), site, registry
+                ),
+                "unplaced": bool(available) and slot is None,
+            }
+        )
+
+    return placed
+
+
+def direct_unit(site):
+    unit_class = site.get("unit_class", "unit")
+    lowered = unit_class.lower()
+    if "radar" in lowered:
+        role = "radar"
+    elif "launcher" in lowered or "_sam_" in lowered:
+        role = "launcher"
+    elif site.get("_source_group") == "ships":
+        role = "ship"
+    else:
+        role = "vehicle"
+    return {
+        "id": site.get("name", unit_class),
+        "name": unit_class,
+        "role": role,
+        "slot_type": "origin",
+        "preset": "mission unit",
+        "world_pos": site.get("_runtime_world_pos", site["tm"][3][:3]),
+        "local_pos": [0.0, 0.0, 0.0],
+        "number": 1,
+        "count": 1,
+        "threat_range": site.get("threatSearchRad"),
+        "template": "",
+        # Explicit mission respawn rules are joined by this unit's id in the
+        # browser. In their absence, a direct mission unit has no fixed
+        # lifecycle rather than an invented generic timer.
+        "lifecycle": {"kind": "none", "source": "mission"},
+        "unplaced": False,
+    }
+
+
+def extract_route(site):
+    raw_waypoints = site.get("way", {})
+    if not isinstance(raw_waypoints, dict) or not raw_waypoints:
+        return None
+
+    points = []
+    speeds = []
+    for waypoint_name, waypoint in raw_waypoints.items():
+        if not isinstance(waypoint, dict) or not is_matrix(waypoint.get("tm")):
+            continue
+        points.append(
+            {
+                "name": waypoint_name,
+                "world_pos": waypoint["tm"][3][:3],
+                "move_type": waypoint.get("props", {}).get("moveType"),
+                "speed": waypoint.get("props", {}).get("speed"),
+            }
+        )
+        speed = waypoint.get("props", {}).get("speed")
+        if isinstance(speed, (int, float)):
+            speeds.append(speed)
+
+    if not points:
+        return None
+    return {
+        "points": points,
+        "closed": bool(site.get("closed_waypoints")),
+        "spline": bool(site.get("isShipSpline")),
+        "speed": speeds[0] if speeds and len(set(speeds)) == 1 else None,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build War Thunder Leaflet map data")
+    parser.add_argument("--input", default=".", help="Directory containing BLKX files")
+    parser.add_argument("--output", default="map_data.json", help="Output JSON path")
+    parser.add_argument(
+        "--mission",
+        required=True,
+        help="Mission BLKX to turn into map data. Template and layout files still come from --input.",
+    )
+    parser.add_argument(
+        "--presets-output",
+        help="Optional JSON file for the dynamically discovered scenario presets.",
+    )
+    parser.add_argument(
+        "--layout-cache",
+        help="Optional JSON file containing pre-extracted static template layouts",
+    )
+    args = parser.parse_args()
+
+    paths = sorted(
+        glob.glob(os.path.join(args.input, "*.blkx"))
+        + glob.glob(os.path.join(args.input, "*.blk"))
+    )
+    documents = {}
+    definitions = {}
+    layouts = {}
+
+    if args.layout_cache:
+        cached_layouts = load_json(args.layout_cache)
+        if not isinstance(cached_layouts, dict):
+            raise SystemExit(f"Invalid layout cache: {args.layout_cache}")
+        layouts.update(cached_layouts)
+
+    for path in paths:
+        data = load_json(path)
+        if not isinstance(data, dict):
+            continue
+        filename = os.path.splitext(os.path.basename(path))[0]
+        documents[filename] = data
+        for key, value in data.items():
+            if isinstance(value, dict):
+                definitions[key] = value
+        layout = build_layout(data)
+        if layout:
+            layouts[filename] = layout
+
+    registry = TemplateRegistry(definitions)
+    mission_data = load_json(args.mission)
+    if not isinstance(mission_data, dict):
+        raise SystemExit(f"Invalid mission file: {args.mission}")
+    presets = discover_presets(mission_data)
+    rank_rules = unit_spawn_rank_rules(mission_data)
+    sites = []
+    source_counts = Counter()
+
+    # Delayed radar units use dummy editor coordinates. At mission start the
+    # trigger assigns each squad member to one of the named foundation objects.
+    all_mission_units = {}
+    squad_members = {}
+    units_root = mission_data.get("units", {})
+    if not isinstance(units_root, dict):
+        units_root = {}
+    for group_units in units_root.values():
+        if not isinstance(group_units, list):
+            continue
+        for unit in group_units:
+            if not isinstance(unit, dict) or not unit.get("name"):
+                continue
+            all_mission_units[unit["name"]] = unit
+            members = unit.get("props", {}).get("squad_members")
+            if isinstance(members, list):
+                squad_members[unit["name"]] = members
+
+    runtime_positions = {}
+    triggers = mission_data.get("triggers", {})
+    if not isinstance(triggers, dict):
+        triggers = {}
+    for trigger in triggers.values():
+        if not isinstance(trigger, dict):
+            continue
+        actions = trigger.get("actions", {})
+        if not isinstance(actions, dict):
+            continue
+        spawn_actions = actions.get("unitSpawnOnObjectGroup", [])
+        if isinstance(spawn_actions, dict):
+            spawn_actions = [spawn_actions]
+        if not isinstance(spawn_actions, list):
+            continue
+        for action in spawn_actions:
+            if not isinstance(action, dict):
+                continue
+            members = squad_members.get(action.get("object"), [])
+            targets = action.get("target", [])
+            if isinstance(targets, str):
+                targets = [targets]
+            for member_name, target_name in zip(members, targets):
+                target = all_mission_units.get(target_name)
+                if target and is_matrix(target.get("tm")):
+                    runtime_positions[member_name] = target["tm"][3][:3]
+
+    # MLRS/TBM editor transforms are off-map holding positions. The mission
+    # respawns each vehicle randomly inside its named 600 m sphere; use the
+    # sphere centre as the honest representative marker position.
+    all_areas = mission_data.get("areas", {})
+    if not isinstance(all_areas, dict):
+        all_areas = {}
+    for unit_name in all_mission_units:
+        if "_mlrs_" in unit_name:
+            spawn_area_name = unit_name.replace("_mlrs_", "_mlrs_spawn_area_")
+        elif "_tactical_missile_launcher_" in unit_name:
+            spawn_area_name = unit_name.replace(
+                "_tactical_missile_launcher_", "_tactical_missile_spawn_area_"
+            )
+        else:
+            continue
+        area = all_areas.get(spawn_area_name)
+        if isinstance(area, dict) and is_matrix(area.get("tm")):
+            runtime_positions[unit_name] = area["tm"][3][:3]
+
+    direct_groups = [
+        (source_group, group_units)
+        for source_group, group_units in units_root.items()
+    ]
+    imported_by_group = {}
+    for preset in presets:
+        for source_group, unit in imported_mission_units(
+            mission_data, documents, preset["rank"]
+        ):
+            imported_by_group.setdefault(source_group, {})[unit.get("name", "")] = unit
+
+    for source_group, group_units in direct_groups:
+        if not isinstance(group_units, list):
+            continue
+        for raw_site in group_units:
+                if (
+                    not isinstance(raw_site, dict)
+                    or not raw_site.get("unit_class")
+                    or not is_matrix(raw_site.get("tm"))
+                ):
+                    continue
+
+                site = dict(raw_site)
+                site["_source_group"] = source_group
+                if site.get("name") in runtime_positions:
+                    site["_runtime_world_pos"] = runtime_positions[site["name"]]
+                source_counts[source_group] += 1
+                layout = layouts.get(site["unit_class"], {"slots": [], "runway": None})
+                editor_world_pos = site["tm"][3][:3]
+                runtime_world_pos = site.get("_runtime_world_pos", editor_world_pos)
+                output_site = {
+                    "name": site.get("name", "unnamed_site"),
+                    "unit_class": site["unit_class"],
+                    "team": site.get("props", {}).get("army"),
+                    "source_group": source_group,
+                    "category": mission_site_category(site, registry),
+                    "world_pos": runtime_world_pos,
+                    "editor_world_pos": editor_world_pos,
+                    "runtime_relocated": runtime_world_pos != editor_world_pos,
+                    "runtime_position_kind": (
+                        "random_spawn_area_center"
+                        if (
+                            "_mlrs_" in site.get("name", "")
+                            or "_tactical_missile_launcher_" in site.get("name", "")
+                        )
+                        else "fixed"
+                    ),
+                    "tm": site["tm"],
+                    "runways": [],
+                    "route": extract_route(site),
+                    "buildings_by_era": {},
+                    "units_by_era": {},
+                }
+
+                if layout.get("runway"):
+                    runway = layout["runway"]
+                    output_site["runways"].append(
+                        {
+                            "start": transform_local_to_world(site["tm"], runway["start"]),
+                            "end": transform_local_to_world(site["tm"], runway["end"]),
+                            "width": runway["width"],
+                        }
+                    )
+
+                for preset in presets:
+                    preset_id = preset["id"]
+                    preset_rank = preset["rank"]
+                    if source_group in {"tankModels", "ships"}:
+                        output_site["buildings_by_era"][preset_id] = []
+                        output_site["units_by_era"][preset_id] = (
+                            [direct_unit(site)]
+                            if spawned_at_rank(rank_rules, site.get("name"), preset_rank)
+                            else []
+                        )
+                        continue
+
+                    template_names, configs = active_templates(site, preset_rank)
+                    buildings, building_slot_ids = create_buildings(
+                        site, layout, template_names, configs, registry
+                    )
+                    settings = registry.unit_settings(
+                        template_names, output_site["team"]
+                    )
+                    output_site["buildings_by_era"][preset_id] = buildings
+                    output_site["units_by_era"][preset_id] = place_spawned_units(
+                        site, layout, settings, building_slot_ids, registry
+                    )
+
+                sites.append(output_site)
+
+    # Imported ships are selected by rank, so create one site per ship name and
+    # populate its per-era unit list with the selected 1970 or 1980 definition.
+    for source_group, named_units in imported_by_group.items():
+        if source_group != "ships":
+            continue
+        for site_name in sorted(named_units):
+            output_site = None
+            for preset in presets:
+                matching = {
+                    unit.get("name"): unit
+                    for group, unit in imported_mission_units(
+                        mission_data, documents, preset["rank"]
+                    )
+                    if group == source_group and unit.get("name") == site_name
+                }
+                raw_site = matching.get(site_name)
+                if raw_site is None:
+                    continue
+                site = ship_with_mission_route(
+                    {**raw_site, "_source_group": source_group}, mission_data
+                )
+                if site is None or not is_matrix(site.get("tm")):
+                    continue
+                # A few imported formation definitions expose a syntactically
+                # valid, but zeroed, matrix even though no mission route was
+                # resolved for them.  The game places those escorts relative
+                # to their formation at runtime; displaying them at world
+                # origin is demonstrably wrong.
+                if not any(float(value) for value in site["tm"][3][:3]):
+                    continue
+                if output_site is None:
+                    source_counts[source_group] += 1
+                    output_site = {
+                        "name": site_name,
+                        "unit_class": site["unit_class"],
+                        "team": site.get("props", {}).get("army"),
+                        "source_group": source_group,
+                        "world_pos": site["tm"][3][:3],
+                        "editor_world_pos": site["tm"][3][:3],
+                        "runtime_relocated": True,
+                        "runtime_position_kind": "ship_route_start",
+                        "tm": site["tm"],
+                        "runways": [],
+                        "route": extract_route(site),
+                        # A ship that exists only in some eras still needs an
+                        # (empty) entry for every scenario preset.
+                        "buildings_by_era": {item["id"]: [] for item in presets},
+                        "units_by_era": {item["id"]: [] for item in presets},
+                    }
+                    sites.append(output_site)
+                output_site["buildings_by_era"][preset["id"]] = []
+                output_site["units_by_era"][preset["id"]] = [direct_unit(site)]
+
+    output_path = args.output
+    if not os.path.isabs(output_path):
+        output_path = os.path.join(args.input, output_path)
+    with open(output_path, "w", encoding="utf-8") as destination:
+        json.dump(sites, destination, indent=2)
+
+    if args.presets_output:
+        with open(args.presets_output, "w", encoding="utf-8") as destination:
+            json.dump(presets, destination, indent=2)
+
+    print(f"Loaded {len(documents)} BLK/BLKX files and {len(layouts)} layouts.")
+    print(f"Extracted {len(sites)} mission objects: {dict(source_counts)}")
+    for preset in presets:
+        preset_id = preset["id"]
+        unit_count = sum(len(site["units_by_era"][preset_id]) for site in sites)
+        building_count = sum(len(site["buildings_by_era"][preset_id]) for site in sites)
+        unplaced_count = sum(
+            unit.get("unplaced", False)
+            for site in sites
+            for unit in site["units_by_era"][preset_id]
+        )
+        print(
+            f"{preset['label']} ({preset_id}): {unit_count} actual units, {building_count} buildings, "
+            f"{unplaced_count} overflow placements"
+        )
+    print(f"Saved {output_path}")
+
+
+if __name__ == "__main__":
+    main()

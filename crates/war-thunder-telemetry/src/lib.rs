@@ -14,6 +14,7 @@ pub struct Snapshot {
     pub objects: Option<Value>,
     pub state: Option<Value>,
     pub indicators: Option<Value>,
+    pub mission: Option<Value>,
     pub errors: BTreeMap<String, String>,
 }
 
@@ -23,13 +24,14 @@ pub struct TelemetryClient {
     last_metadata: u64,
     last_state: u64,
     last_indicators: u64,
+    last_mission: u64,
 }
 
 impl TelemetryClient {
     pub fn new() -> Result<Self, reqwest::Error> {
         Ok(Self { client: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(1000)).connect_timeout(Duration::from_millis(450)).build()?,
-            cached: Snapshot::default(), last_metadata: 0, last_state: 0, last_indicators: 0 })
+            cached: Snapshot::default(), last_metadata: 0, last_state: 0, last_indicators: 0, last_mission: 0 })
     }
     async fn get(&self, path: &str) -> Result<Value, String> {
         let mut response = self.client.get(format!("http://127.0.0.1:8111/{path}"))
@@ -47,22 +49,31 @@ impl TelemetryClient {
         let now = now_ms();
         // Multiple frontend callers share this cache under a mutex, avoiding duplicate polling.
         if now.saturating_sub(self.cached.at) < 250 { return self.cached.clone(); }
-        let objects = self.get("map_obj.json").await;
+        // Independent fixed endpoints run concurrently; an unavailable endpoint
+        // cannot multiply the request timeout for an entire refresh cycle.
+        let (objects, metadata, state, indicators, mission) = tokio::join!(
+            self.get("map_obj.json"),
+            async { if now.saturating_sub(self.last_metadata)>=2000 {Some(self.get("map_info.json").await)} else {None} },
+            async { if now.saturating_sub(self.last_state)>=1000 {Some(self.get("state").await)} else {None} },
+            async { if now.saturating_sub(self.last_indicators)>=3000 {Some(self.get("indicators").await)} else {None} },
+            async { if now.saturating_sub(self.last_mission)>=3000 {Some(self.get("mission.json").await)} else {None} }
+        );
         save_result(&mut self.cached.objects, &mut self.cached.errors, "objects", objects);
-        if now.saturating_sub(self.last_metadata) >= 2000 {
-            let result = self.get("map_info.json").await;
+        if let Some(result) = metadata {
             save_result(&mut self.cached.map_info, &mut self.cached.errors, "mapInfo", result);
             self.last_metadata = now;
         }
-        if now.saturating_sub(self.last_state) >= 1000 {
-            let result = self.get("state").await;
+        if let Some(result) = state {
             save_result(&mut self.cached.state, &mut self.cached.errors, "state", result);
             self.last_state = now;
         }
-        if now.saturating_sub(self.last_indicators) >= 3000 {
-            let result = self.get("indicators").await;
+        if let Some(result) = indicators {
             save_result(&mut self.cached.indicators, &mut self.cached.errors, "indicators", result);
             self.last_indicators = now;
+        }
+        if let Some(result) = mission {
+            save_result(&mut self.cached.mission, &mut self.cached.errors, "mission", result);
+            self.last_mission = now;
         }
         self.cached.at = now_ms();
         self.cached.clone()

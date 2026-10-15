@@ -1922,7 +1922,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ntl-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "rand",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "ntl-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "tauri",
@@ -3891,7 +3891,7 @@ dependencies = [
 
 [[package]]
 name = "war-thunder-telemetry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

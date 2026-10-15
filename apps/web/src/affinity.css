@@ -1,0 +1,8 @@
+:root{--ntl-team-1:#a0aec0;--ntl-team-2:#a0aec0}
+.site-overview-icon.team-1,.composition-site.team-1 summary,.team-red{color:var(--ntl-team-1)!important}
+.site-overview-icon.team-2,.composition-site.team-2 summary,.team-blue{color:var(--ntl-team-2)!important}
+.vehicle-card.team-1,.leaflet-popup-content .vehicle-card.team-1{border-top-color:var(--ntl-team-1)!important}
+.vehicle-card.team-2,.leaflet-popup-content .vehicle-card.team-2{border-top-color:var(--ntl-team-2)!important}
+.airfield-overview-icon.team-1{--airfield-team:var(--ntl-team-1)!important}
+.airfield-overview-icon.team-2{--airfield-team:var(--ntl-team-2)!important}
+.ntl-airfield-status{font-size:12px;line-height:1.5}.ntl-airfield-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #314052}.ntl-airfield-row button{min-height:32px}.ntl-airfield-row small{display:block;color:#b0b9c6}.ntl-airfield-dead{color:#ff6572}

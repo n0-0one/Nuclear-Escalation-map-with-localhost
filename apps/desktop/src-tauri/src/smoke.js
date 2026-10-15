@@ -16,10 +16,26 @@
     if(!marked)throw new Error('Component control failed');
     document.querySelector('#undo-status').click();
     const native=await window.__TAURI_INTERNALS__.invoke('telemetry_snapshot');
+    if(document.querySelector('#connect-button').textContent==='Disconnect')document.querySelector('#connect-button').click();
+    const api=window.__TAURI_INTERNALS__;let overlayReport;
+    await api.invoke('plugin:event|listen',{event:'ntl:overlay-smoke-result',target:{kind:'Any'},handler:api.transformCallback(event=>{overlayReport=event.payload;})});
+    document.querySelector('#open-nearby').click();
+    const player={position:{x:0,z:0},player:true,type:'aircraft',icon:'Player',relation:'friendly',kind:'vehicle'};
+    const contacts=Array.from({length:5},(_,i)=>({position:{x:3100+i*10,z:3100},player:false,type:'ground_model',icon:'MediumTank',relation:'enemy',kind:'vehicle'}));
+    for(let i=0;i<100&&!overlayReport;i++){
+      const at=Date.now();
+      window.dispatchEvent(new CustomEvent('ntl:frame',{detail:{frame:{at,active:true,connected:true,player,objects:[player,...contacts],errors:{}},context:window.ntlMap.context(),tracks:contacts.map((observation,id)=>({id,observation,at})),mode:'smoke',mapAgrees:true}}));
+      await delay(150);
+    }
+    if(!overlayReport?.success)throw new Error('Native overlay checks failed: '+JSON.stringify(overlayReport));
+    await api.invoke('configure_overlay',{clickThrough:true});
+    await api.invoke('close_overlay');
+    await api.invoke('open_overlay');
+    await api.invoke('configure_overlay',{clickThrough:false});
     const images=Array.from(document.querySelectorAll('.leaflet-image-layer'));
     for(let i=0;i<100&&!images.some(img=>img.complete&&img.naturalWidth>0);i++)await delay(100);
     const loadedImage=images.some(img=>img.complete&&img.naturalWidth>0);
     if(!loadedImage)throw new Error('Bundled map image unavailable');
-    await window.__TAURI_INTERNALS__.invoke('native_smoke_complete',{report:{success:true,origin:location.origin,url:location.href,readyMs:Math.round(readyMs),loadedImage,context:window.ntlMap.context(),componentAction:marked,nativeTelemetry:{hasMapInfo:!!native.mapInfo,objects:Array.isArray(native.objects)?native.objects.length:0,errors:native.errors},frontend:window.ntlApp.snapshot()}});
+    await window.__TAURI_INTERNALS__.invoke('native_smoke_complete',{report:{success:true,origin:location.origin,url:location.href,readyMs:Math.round(readyMs),loadedImage,context:window.ntlMap.context(),componentAction:marked,overlay:overlayReport,overlayRecoveryCommands:true,nativeTelemetry:{hasMapInfo:!!native.mapInfo,objects:Array.isArray(native.objects)?native.objects.length:0,errors:native.errors},frontend:window.ntlApp.snapshot()}});
   }catch(error){await window.__TAURI_INTERNALS__.invoke('native_smoke_complete',{report:{success:false,error:String(error),url:location.href}});}
 })();

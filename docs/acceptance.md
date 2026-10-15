@@ -1,4 +1,6 @@
-# Verification record — 0.1.0
+# Historical verification record — 0.1.0
+
+The measurements below describe the 0.1.0 build tested on 2026-10-14. They do not validate subsequent settings, contact-display or companion-overlay changes. Results for the next release must be recorded separately after executing its tests.
 
 Verified on Windows 11 on 2026-10-14. This is a working field build, with the remaining limits listed below. A passing build is not evidence of every gameplay mechanic working.
 

@@ -11,4 +11,6 @@ Workspace audited: empty on 2026-10-14. Source snapshot: majorlier/nuclear-thund
 
 The existing renderer remains JavaScript to reduce migration risk; new application logic is TypeScript. No React rewrite or iframe. Map state and simulation are separated. Real localhost is available during this implementation, but mission/scenario and precise per-component kill events are not present in the observed schema.
 
-Deployment target supplied by the user: n0-0one/Nuclear-Escalation-map-with-localhost. Local origin is configured. The repository was private and empty when inspected; publication is pending local Git authentication and a successful Pages deployment. See acceptance.md for the final executed checks.
+Website repository: n0-0one/Nuclear-Escalation-map-with-localhost. See the latest GitHub workflow run for deployment status and acceptance.md for executed checks. The original 0.1.0 verification record remains historical; new release claims require new evidence.
+
+The next iteration adds clearer live contact rendering, player-relative hostility, better target/route navigation, settings, aiming-point and point-of-interest display where available, and a native companion minimap. It also adds a reviewed data-update branch based on majorlier's upstream automation. The game API's uncertainty remains explicit: unsupported BR, identity and destruction data must not be presented as confirmed.

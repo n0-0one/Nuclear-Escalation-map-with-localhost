@@ -10,4 +10,6 @@ release/
 docs/master-request.md
 docs/verification/
 tests/fixtures/observed-localhost.json
+__pycache__/
+*.pyc
 

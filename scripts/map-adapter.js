@@ -7,6 +7,16 @@ window.ntlMap = {
     variants() { return globalMapVariants; },
     definitions: MAP_DEFINITIONS,
     presets() { return globalPresetData.presets; },
+    playerTeam() { return ntlPlayerTeam; },
+    setPlayerTeam(team) {
+        const value = team === 1 || team === 2 ? team : 0;
+        if (ntlPlayerTeam === value) return;
+        ntlPlayerTeam = value;
+        document.documentElement.dataset.playerTeam = String(value);
+        document.documentElement.style.setProperty('--ntl-team-1', teamColor(1));
+        document.documentElement.style.setProperty('--ntl-team-2', teamColor(2));
+        if (globalSiteData.length) { renderMapData(selectedPresetId()); window.dispatchEvent(new Event('ntl:context')); }
+    },
     mission() { return globalMissionLogic; },
     roads() { return globalRoadDataByMap[currentMapId] || []; },
     convoyRoutes() {

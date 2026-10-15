@@ -1,0 +1,30 @@
+import {describe,it,expect} from 'vitest';
+import {normalize,colorRelation} from '../../packages/core/telemetry';
+import {ScenarioMatcher,inferTeamFromRunways,nearbyGroups} from '../../packages/core/identification';
+import {AirfieldTracker} from '../../packages/core/airfields';
+import type {Observation,RawFrame,SiteData} from '../../packages/core/types';
+const info={valid:true,map_min:[-131072,-131072],map_max:[131072,131072],map_generation:1};
+const raw=(objects:unknown[],at=1000):RawFrame=>({at,mapInfo:info,objects,state:{valid:true}});
+const observation=(x=0,z=0):Observation=>({position:{x,z},icon:'MediumTank',type:'ground_model',color:'#fa0C00',heading:null,player:false,relation:'enemy',kind:'vehicle'});
+describe('player-relative contacts and personal marks',()=>{
+  it('uses enemy and friendly game colours independently of national faction',()=>{expect(colorRelation('#fa0C00')).toBe('enemy');expect(colorRelation('#174DFF')).toBe('friendly');expect(colorRelation('#39D921')).toBe('friendly');expect(colorRelation('#faC81E')).toBe('unknown');});
+  it('keeps red points of interest out of enemy vehicle counts',()=>{const frame=normalize(raw([{x:.2,y:.3,type:'point_of_interest',icon:'point_of_interest',color:'#fa0C00'},{x:.4,y:.5,type:'waypoint',icon:'waypoint',color:'#faC81E'}]));expect(frame.objects[0]).toMatchObject({kind:'point-of-interest',relation:'neutral'});expect(frame.objects[1].kind).toBe('aiming-point');});
+  it('never calls a generic bomber nuclear',()=>{const objects=normalize(raw([{x:.5,y:.5,type:'aircraft',icon:'Bomber'},{x:.6,y:.6,type:'aircraft',icon:'nuclear_bomber'}])).objects;expect(objects[0].nuclear).toBe(false);expect(objects[1].nuclear).toBe(true);});
+  it('excludes enemy groups near aiming points and POI but not unrelated groups',()=>{const enemies=[...Array.from({length:5},(_,i)=>observation(3000+i*10,3000)),...Array.from({length:4},(_,i)=>observation(9000+i*10,9000))];const mark={...observation(3050,3050),kind:'aiming-point' as const,relation:'neutral' as const};const groups=nearbyGroups([...enemies,mark],{x:0,z:0},20000,1000,4);expect(groups).toHaveLength(1);expect(groups[0].count).toBe(4);});
+});
+describe('battle identification',()=>{
+  const sites:SiteData[]=Array.from({length:3},(_,site)=>({name:`site${site}`,team:1,world_pos:[site*5000,0,0],units_by_era:{early:Array.from({length:4},(_,i)=>({name:'old',world_pos:[site*5000+i*300,0,0]})),late:Array.from({length:4},(_,i)=>({name:'new',world_pos:[site*5000+i*300,0,0]}))}}));
+  const matcher=new ScenarioMatcher({standard:sites},[{id:'early'},{id:'late'}],name=>({on_radar_as:name==='old'?'SAM':'MediumTank'}));
+  it('recognizes a unique scenario from multiple distinct static sites',()=>{const frame={...normalize(raw([])),objects:sites.flatMap(s=>(s.units_by_era!.late).map(u=>({...observation(u.world_pos[0],0),relation:'friendly' as const})))};const result=matcher.infer(frame,'archipelago',1);expect(result).toMatchObject({variant:'standard',scenario:'late',playerTeam:1,confidence:'inferred'});});
+  it('keeps indistinguishable scenarios unknown',()=>{const duplicate=sites.map(s=>({...s,units_by_era:{early:s.units_by_era!.late,late:s.units_by_era!.late}}));const same=new ScenarioMatcher({standard:duplicate},[{id:'early'},{id:'late'}],()=>({on_radar_as:'MediumTank'}));const frame={...normalize(raw([])),objects:sites.flatMap(s=>(s.units_by_era!.late).map(u=>({...observation(u.world_pos[0],0),relation:'friendly' as const})))};expect(same.infer(frame,'archipelago',1).scenario).toBeNull();});
+  it('does not accept one nearby contact as battle evidence',()=>{expect(matcher.infer({...normalize(raw([])),objects:[observation()]},'archipelago').confidence).toBe('unknown');});
+});
+describe('airfield evidence',()=>{
+  const sites:SiteData[]=Array.from({length:4},(_,i)=>({name:`airfield${i}`,team:1,world_pos:[i*5000,0,0],runways:[{start:[i*5000-100,0,0],end:[i*5000+100,0,0]}]}));
+  const frame=(at:number,omit=false)=>({...normalize(raw([],at)),objects:sites.filter((_,i)=>!omit||i!==0).map(s=>({...observation(s.world_pos[0],0),type:'airfield',kind:'objective' as const,relation:'friendly' as const}))});
+  it('normalizes runway endpoints without requiring x/y',()=>{expect(normalize(raw([{type:'airfield',sx:.4,sy:.4,ex:.6,ey:.6,color:'#174DFF'}])).objects[0]).toMatchObject({type:'airfield',position:{x:0,z:0},kind:'objective'});});
+  it('marks disappearance as missing, never destroyed, and manual evidence persists',()=>{const tracker=new AirfieldTracker();tracker.reset(sites);tracker.update(frame(1000),sites);tracker.update(frame(2000,true),sites);tracker.update(frame(11000,true),sites);expect(tracker.states.get('airfield0')!.status).toBe('missing');tracker.manual('airfield0',true);tracker.update(frame(12000),sites);expect(tracker.states.get('airfield0')).toMatchObject({status:'destroyed',source:'manual'});});
+  it('does not treat telemetry loss as disappearance',()=>{const tracker=new AirfieldTracker();tracker.reset(sites);tracker.update(frame(1000),sites);tracker.update({...frame(15000,true),errors:{objects:'timeout'}},sites);expect(tracker.states.get('airfield0')!.status).toBe('seen');});
+  it('requires explicit destruction for every runway before marking an airfield destroyed',()=>{const airport={...sites[0],runways:[...sites[0].runways!,{start:[900,0,0],end:[1100,0,0]}]};const tracker=new AirfieldTracker();tracker.reset([airport]);const destroyed={...observation(),type:'airfield',kind:'objective' as const,explicitStatus:'destroyed' as const};tracker.update({...frame(1000),objects:[destroyed]},[airport]);expect(tracker.states.get(airport.name)!.status).toBe('seen');tracker.update({...frame(2000),objects:[destroyed,{...destroyed,position:{x:1000,z:0}}]},[airport]);expect(tracker.states.get(airport.name)!.status).toBe('destroyed');});
+  it('requires three consistent runway relations to infer selected-layout team',()=>{expect(inferTeamFromRunways(frame(1000),sites)).toBe(1);expect(inferTeamFromRunways({...frame(1000),objects:frame(1000).objects.slice(0,1)},sites)).toBe(0);});
+});

@@ -13,9 +13,21 @@ export function normalize(frame:RawFrame):NormalizedFrame {
   const connected=record(frame.mapInfo)||Array.isArray(frame.objects)||record(frame.state)||record(frame.indicators);
   const validObjects=Array.isArray(frame.objects);
   if(info?.valid && validObjects) for(const obj of (frame.objects as unknown[]).slice(0,5000)) {
-    if(!record(obj)||!finite(obj.x)||!finite(obj.y)||obj.x<0||obj.x>1||obj.y<0||obj.y>1) continue;
-    objects.push({position:telemetryToWorld(obj.x,obj.y,info),icon:typeof obj.icon==='string'?obj.icon:'unknown',type:typeof obj.type==='string'?obj.type:'unknown',
-      color:typeof obj.color==='string'&&/^#[0-9a-f]{6}$/i.test(obj.color)?obj.color:'#a3a9b5',
+    if(!record(obj))continue;
+    const airfield=obj.type==='airfield'&&[obj.sx,obj.sy,obj.ex,obj.ey].every(finite);
+    const x=airfield?(obj.sx+obj.ex)/2:obj.x,y=airfield?(obj.sy+obj.ey)/2:obj.y;
+    if(!finite(x)||!finite(y)||x<0||x>1||y<0||y>1)continue;
+    const icon=typeof obj.icon==='string'?obj.icon:'unknown',type=typeof obj.type==='string'?obj.type:'unknown';
+    const color=typeof obj.color==='string'&&/^#[0-9a-f]{6}$/i.test(obj.color)?obj.color:'#a3a9b5';
+    const key=(type+' '+icon).toLowerCase().replace(/[- ]/g,'_');
+    const poi=key.includes('point_of_interest');
+    const aiming=/aiming_point|aim_point|bombing_target/.test(key)||(icon==='waypoint'&&isYellow(color));
+    const nuclear=obj.nuclear===true||obj.is_nuclear===true||/(?:^|[^a-z])(?:nuclear|nuke)(?:[^a-z]|$)/i.test(`${icon} ${obj.icon_bg||''}`.replace(/([a-z])([A-Z])/g,'$1 $2').replaceAll('_',' '));
+    objects.push({position:telemetryToWorld(x,y,info),icon,type,color,relation:poi||aiming?'neutral':colorRelation(color),
+      kind:poi?'point-of-interest':aiming?'aiming-point':airfield||['bombing_point','defending_point','capture_zone'].includes(icon)?'objective':'vehicle',nuclear,
+      telemetryId:typeof obj.id==='string'||finite(obj.id)?String(obj.id):undefined,
+      explicitStatus:obj.destroyed===true||obj.alive===false||obj.health===0||obj.status==='destroyed'?'destroyed':obj.alive===true||(finite(obj.health)&&obj.health>0)?'active':undefined,
+      modelName:typeof obj.vehicle==='string'?obj.vehicle:typeof obj.model==='string'?obj.model:undefined,
       heading:finite(obj.dx)&&finite(obj.dy)&&Math.hypot(obj.dx,obj.dy)>0.001?(Math.atan2(obj.dx,-obj.dy)*180/Math.PI+360)%360:null,
       player:obj.icon==='Player'});
   }
@@ -24,8 +36,16 @@ export function normalize(frame:RawFrame):NormalizedFrame {
   let active:boolean|null=null;
   if(info?.valid && (player || (record(frame.state)&&frame.state.valid===true))) active=true;
   else if(record(frame.mapInfo)&&frame.mapInfo.valid===false && record(frame.state)&&frame.state.valid===false) active=false;
-  return {at:frame.at,connected,active,info,player,objects,unsupported:connected&&(!info||!validObjects),errors:frame.errors||{},source:frame.simulated?'SIMULATED':'TELEMETRY'};
+  return {at:frame.at,connected,active,info,player,objects,mission:frame.mission,unsupported:connected&&(!info||!validObjects),errors:frame.errors||{},source:frame.simulated?'SIMULATED':'TELEMETRY'};
 }
+export function colorRelation(color:string):'friendly'|'enemy'|'unknown' {
+  if(!/^#[0-9a-f]{6}$/i.test(color))return 'unknown';
+  const r=parseInt(color.slice(1,3),16),g=parseInt(color.slice(3,5),16),b=parseInt(color.slice(5,7),16);
+  if(r>170&&r>g*1.6&&r>b*1.6)return 'enemy';
+  if((b>150&&b>r*1.5)||(g>140&&g>r*1.4&&g>b*1.3))return 'friendly';
+  return 'unknown';
+}
+function isYellow(color:string){const r=parseInt(color.slice(1,3),16),g=parseInt(color.slice(3,5),16),b=parseInt(color.slice(5,7),16);return r>160&&g>130&&b<100;}
 export interface Recognition { mapId: MapId|null; confidence:'inferred'|'unknown'; matches:number; reason:string; }
 export function recognizeMap(frame:RawFrame, variants:Record<string,SiteData[]>):Recognition {
   const info=parseInfo(frame.mapInfo);

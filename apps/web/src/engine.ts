@@ -2,7 +2,8 @@ import type * as Leaflet from 'leaflet';
 import type {Context,SiteData,UnitRecord} from '../../../packages/core/types';
 export interface MapEngine {
   L:typeof Leaflet;map:Leaflet.Map;ready:boolean;context():Context;sites():SiteData[];variants():Record<string,SiteData[]>;
-  definitions:Record<string,any>;presets():{id:string;label:string}[];mission():any;roads():any[];
+  definitions:Record<string,any>;presets():{id:string;label:string;rank_range?:number[]}[];mission():any;roads():any[];
+  setPlayerTeam(team:number):void;playerTeam():number;
   specs(name:string):any;category(site:SiteData):string;displayName(name:string):string;lifecycle(unit:any,site:SiteData):any;
   worldToLatLng(x:number,z:number):[number,number];latLngToWorld(p:Leaflet.LatLng):[number,number];terrain(x:number,y:number):number|null;
   setContext(mapId:string,variant?:string,scenario?:string):void;focus(name:string):void;markUnit(id:string,status:string):void;markSite(name:string,status:string):void;

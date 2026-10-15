@@ -9,8 +9,8 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -22,7 +22,7 @@ jobs:
       - run: npm run desktop:build
       - run: ./tests/integration/native-smoke.ps1
       - run: cargo build --locked --release -p ntl-bridge
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Nuclear-Thunder-Live-Windows
           path: |
