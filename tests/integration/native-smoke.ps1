@@ -1,11 +1,13 @@
 param([string]$Executable = './target/release/ntl-desktop.exe')
 $ErrorActionPreference = 'Stop'
+$reportDirectory = New-Item -ItemType Directory -Path 'docs/verification' -Force
 $started = [DateTime]::UtcNow
 $timer = [Diagnostics.Stopwatch]::StartNew()
-$application = Start-Process -FilePath (Resolve-Path -LiteralPath $Executable) -ArgumentList '--smoke-test' -WindowStyle Hidden -PassThru
+$application = Start-Process -FilePath (Resolve-Path -LiteralPath $Executable) -ArgumentList '--smoke-test' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $reportDirectory.FullName 'native-stdout.log') -RedirectStandardError (Join-Path $reportDirectory.FullName 'native-stderr.log')
 # Wait for this application, not an entire WebView2 process tree. Shared browser
 # helper processes can outlive the Tauri window and make Start-Process -Wait hang.
 if (-not $application.WaitForExit(60000)) {
+    Get-Process -Name ntl-desktop,msedgewebview2 -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,CPU,Responding | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $reportDirectory.FullName 'native-timeout.json')
     Stop-Process -Id $application.Id -ErrorAction SilentlyContinue
     throw 'Native smoke process exceeded 60 seconds'
 }
