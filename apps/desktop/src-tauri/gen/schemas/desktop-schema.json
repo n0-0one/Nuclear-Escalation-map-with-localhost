@@ -189,6 +189,18 @@
           "markdownDescription": "Enables the configure_overlay command without any pre-configured scope."
         },
         {
+          "description": "Enables the datamine_bootstrap command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-datamine-bootstrap",
+          "markdownDescription": "Enables the datamine_bootstrap command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the datamine_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-datamine-check",
+          "markdownDescription": "Enables the datamine_check command without any pre-configured scope."
+        },
+        {
           "description": "Enables the export_json command without any pre-configured scope.",
           "type": "string",
           "const": "allow-export-json",
@@ -223,6 +235,18 @@
           "type": "string",
           "const": "deny-configure-overlay",
           "markdownDescription": "Denies the configure_overlay command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the datamine_bootstrap command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-datamine-bootstrap",
+          "markdownDescription": "Denies the datamine_bootstrap command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the datamine_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-datamine-check",
+          "markdownDescription": "Denies the datamine_check command without any pre-configured scope."
         },
         {
           "description": "Denies the export_json command without any pre-configured scope.",

@@ -4,6 +4,14 @@ use war_thunder_telemetry::{TelemetryClient, Snapshot};
 use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use std::io::Write;
 struct SmokeMode(bool);
+#[tauri::command]
+async fn datamine_bootstrap(window:WebviewWindow,updater:tauri::State<'_,Mutex<datamine_updater::Updater>>)->Result<datamine_updater::DataSnapshot,String>{
+    require_main(&window)?;Ok(updater.lock().await.snapshot())
+}
+#[tauri::command]
+async fn datamine_check(window:WebviewWindow,updater:tauri::State<'_,Mutex<datamine_updater::Updater>>)->Result<datamine_updater::UpdateResult,String>{
+    require_main(&window)?;updater.lock().await.check().await
+}
 fn require_main(window: &WebviewWindow) -> Result<(), String> {
     if window.label() != "main" { return Err("This action is available in the main window only".into()); }
     Ok(())
@@ -79,7 +87,11 @@ fn main() {
     tauri::Builder::default()
         .manage(SmokeMode(smoke))
         .manage(Mutex::new(TelemetryClient::new().expect("HTTP client initialization failed")))
-        .setup(move |app| { if smoke { if let Some(window)=app.get_webview_window("main"){window.hide()?;} let handle=app.handle().clone();tauri::async_runtime::spawn(async move{tokio::time::sleep(std::time::Duration::from_secs(45)).await;handle.exit(2);}); } Ok(()) })
+        .setup(move |app| {
+            let directory=if smoke{std::env::current_dir()?.join(".local/native-smoke-data")}else{app.path().app_local_data_dir()?.join("datamine-v1")};
+            let lock:serde_json::Value=serde_json::from_str(include_str!("../../../web/public/datamine-lock.json"))?;
+            app.manage(Mutex::new(datamine_updater::Updater::new(directory,lock["accepted_commit"].as_str().unwrap_or("bundled").into()).map_err(std::io::Error::other)?));
+            if smoke { if let Some(window)=app.get_webview_window("main"){window.hide()?;} let handle=app.handle().clone();tauri::async_runtime::spawn(async move{tokio::time::sleep(std::time::Duration::from_secs(45)).await;handle.exit(2);}); } Ok(()) })
         .on_window_event(|window, event| {
             if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
                 if let Some(overlay) = window.app_handle().get_webview_window("overlay") {
@@ -96,6 +108,6 @@ fn main() {
                 let _=webview.eval(include_str!("overlay-smoke.js"));
             }
         })
-        .invoke_handler(tauri::generate_handler![telemetry_snapshot, export_json, native_smoke_complete, open_overlay, close_overlay, configure_overlay])
+        .invoke_handler(tauri::generate_handler![telemetry_snapshot, export_json, native_smoke_complete, open_overlay, close_overlay, configure_overlay, datamine_bootstrap, datamine_check])
         .run(tauri::generate_context!()).expect("Unable to start Nuclear Thunder Live");
 }

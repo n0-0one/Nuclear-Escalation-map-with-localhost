@@ -10,10 +10,22 @@ The **Check War Thunder datamine** workflow runs daily at **05:23 UTC** and can 
 2. Download the mission, template, runtime-rule, localization and unit-specification inputs needed by the reviewed extractor. Every run uses one pinned datamine revision.
 3. Generate all four map variants, scenario presets, mission rules and unit details in a temporary directory.
 4. Validate all candidate JSON before copying any file into the app. Verify finite coordinates, known map variants, scenario coverage, unique site names, component lifecycle values, unit model names and source provenance.
-5. If relevant data changed, run the application tests, production build and browser tests. A changed datamine commit alone does not create an update.
+5. Run the application tests, production build and browser tests. A changed datamine commit alone does not create a data update.
 6. Publish the validated data patch to `automation/datamine-update` and create or update a **draft pull request**. The generation report appears in the workflow summary.
 
-The workflow does **not** merge its own proposal. Review the changed scenarios and map preview, mark the proposal ready, then merge it. This matches majorlier's draft-review process. A normal merge into `main` runs the web/Rust checks and publishes the new website. The desktop application embeds its data, so existing installed copies remain on their shipped data until a new Windows build is released. Use **Windows release artifacts** for that build and publish the resulting installer in the app repository.
+7. Publish a validated JSON pack and SHA-256 manifest on `codex/windows-data-v1`. Installed Windows applications from version 0.2.1 check this feed automatically. Publication happens only after the generation job and its tests succeed; it does not wait for the source PR to merge.
+
+The workflow does **not** merge its own proposal. Review the changed scenarios and map preview, mark the proposal ready, then merge it. This matches majorlier's draft-review process. A normal merge into `main` runs the web/Rust checks and publishes the new website. Windows apps use the separately validated data feed described below. Changes to executable code, supported map formats or bundled artwork still require a new release.
+
+## Automatic updates in Windows
+
+Install version **0.2.1 or later once**. Older executables do not contain the updater. The app loads its verified cache before starting the map, checks for new data shortly after launch and repeats the check every four hours while running. **Settings → Automatic mission data → Check data now** starts a manual check and shows the loaded revision and result.
+
+Updates become active on the **next app launch**. The current battle, map and notes are not reset by a background download. An app that is closed checks again when opened. Offline startup uses the last valid cache or the bundled map.
+
+The fixed feed is hosted in this project's web repository on `codex/windows-data-v1`. The native updater accepts HTTPS from the fixed GitHub raw-content path, refuses redirects, limits response size, verifies the exact SHA-256 hash and validates the supported JSON schema. It accepts exactly twelve data files. It cannot download an EXE, script, installer, terrain image or an arbitrary user-supplied URL.
+
+Data is stored under `%LOCALAPPDATA%\io.nuclearthunder.live\datamine-v1`. Downloads are validated before installation and committed through atomic file replacement. The app keeps the previous verified pack as a fallback; an invalid cache falls back to it or the bundled resources. No game data, HUD text or pairing code is sent with update requests. The overlay cannot invoke the updater or read its cache. SHA-256 checks integrity against the manifest delivered over HTTPS; it is not a separate publisher signature.
 
 ## Data-only import boundary
 
@@ -27,7 +39,9 @@ The live renderer, adapter hooks, application interface, desktop integration, wo
 
 The extractor source is vendored under `scripts/datamine/tools`, unchanged from majorlier commit `d3b9854ed3fa065324840c2b8e7f1324837e86da`. The referenced automation branch was inspected at `7ae7a517bc3e883b2f3e3989d864f93804c7fac8`; its differences were generated data, not new executable tooling. `scripts/datamine/provenance.json` records the source and SHA-256 hashes of the reviewed files. Hashing normalizes Windows line endings. Future extractor changes require a source review and a refreshed manifest; a scheduled run never downloads or executes updated scripts from a moving branch.
 
-The generation job has read-only repository permissions. Only the separate proposal job receives `contents: write` and `pull-requests: write`, after validation succeeds. No personal access token is required. GitHub suppresses ordinary workflow runs caused by its own `GITHUB_TOKEN`, so the generation job runs the candidate's tests itself before opening the proposal. Do not treat the absence of additional PR-triggered checks as additional test evidence.
+After upstream extraction, our `hud_names.py` attaches exact English short names from the same pinned localization file to `unit_specs.json`. It verifies the source Git blob hash from the datamine lock before reading the CSV. These aliases support HUD kill correlation and BR detection and update with the normal data feed.
+
+The generation job has read-only repository permissions. The separate proposal job receives `contents: write` and `pull-requests: write`; the separate Windows feed publication job receives only `contents: write`, after validation succeeds. No personal access token is required. GitHub suppresses ordinary workflow runs caused by its own `GITHUB_TOKEN`, so the generation job runs the candidate's tests itself before opening the proposal. Do not treat the absence of additional PR-triggered checks as additional test evidence.
 
 ## Repository setup
 

@@ -36,7 +36,8 @@ export function normalize(frame:RawFrame):NormalizedFrame {
   let active:boolean|null=null;
   if(info?.valid && (player || (record(frame.state)&&frame.state.valid===true))) active=true;
   else if(record(frame.mapInfo)&&frame.mapInfo.valid===false && record(frame.state)&&frame.state.valid===false) active=false;
-  return {at:frame.at,connected,active,info,player,objects,mission:frame.mission,unsupported:connected&&(!info||!validObjects),errors:frame.errors||{},source:frame.simulated?'SIMULATED':'TELEMETRY'};
+  const hud=record(frame.hud)&&Array.isArray(frame.hud.damage)?frame.hud.damage.slice(-200).filter((m:unknown)=>record(m)&&finite(m.id)&&typeof m.msg==='string'&&m.msg.length<=2048).map((m:any)=>({id:m.id,text:m.msg})):[];
+  return {at:frame.at,connected,active,info,player,objects,mission:frame.mission,hud,unsupported:connected&&(!info||!validObjects),errors:frame.errors||{},source:frame.simulated?'SIMULATED':'TELEMETRY'};
 }
 export function colorRelation(color:string):'friendly'|'enemy'|'unknown' {
   if(!/^#[0-9a-f]{6}$/i.test(color))return 'unknown';

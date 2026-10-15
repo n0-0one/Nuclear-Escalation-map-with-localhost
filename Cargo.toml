@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/war-thunder-telemetry", "apps/bridge", "apps/desktop/src-tauri"]
+members = ["crates/war-thunder-telemetry", "crates/datamine-updater", "apps/bridge", "apps/desktop/src-tauri"]
 resolver = "2"
 
 [workspace.dependencies]

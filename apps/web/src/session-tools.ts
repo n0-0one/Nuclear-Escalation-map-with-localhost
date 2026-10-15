@@ -6,7 +6,7 @@ import type {Context,NormalizedFrame} from '../../../packages/core/types';
 let matcher:ScenarioMatcher|null=null,lastInference=0,lastRender='',lastEvidence='',consistent=0,lastSession='',teamMode=0;
 const airfields=new AirfieldTracker();
 const emit=(name:string,detail:unknown)=>window.dispatchEvent(new CustomEvent(name,{detail}));
-window.addEventListener('ntl:team-mode',event=>{teamMode=(event as CustomEvent).detail.team;lastInference=0;});
+window.addEventListener('ntl:team-mode',event=>{teamMode=(event as CustomEvent).detail.team;lastInference=0;lastEvidence='';consistent=0;});
 function panel(){
   let section=document.getElementById('airfield-section');if(section)return section;
   const target=document.getElementById('live-panel');if(!target)return null;
@@ -32,7 +32,7 @@ window.addEventListener('ntl:frame',event=>{
   if(!context||!window.ntlMap?.ready)return;const engine=window.ntlMap;
   if(mapAgrees===false)return;
   if(modeTeam!==undefined)teamMode=modeTeam;
-  matcher??=new ScenarioMatcher(engine.variants(),engine.presets(),name=>engine.specs(name));
+  matcher??=new ScenarioMatcher(engine.variants(),engine.presets(),name=>engine.specs(name),name=>engine.displayName(name));
   const session=frame.info?.valid?JSON.stringify([context.mapId,context.variant,frame.info.map_generation,mode]):lastSession;
   if(session!==lastSession){lastSession=session;airfields.reset(engine.sites());consistent=0;lastEvidence='';lastRender='';}
   airfields.update(frame,engine.sites());renderAirfields();
@@ -44,7 +44,10 @@ window.addEventListener('ntl:frame',event=>{
   // Runway colours establish friendly versus enemy for the selected static layout,
   // but do not establish a nation or a mirrored layout on their own.
   if(!teamMode&&runwaysTeam)emit('ntl:team-inferred',{team:runwaysTeam,reason:'Friendly/enemy runway colours match the selected layout; national identity is not reported.'});
-  if(consistent>=2)emit('ntl:context-evidence',{mapId:context.mapId,variant:evidence.variant||undefined,scenario:evidence.scenario||undefined,reason:evidence.reason,confidence:evidence.confidence});
+  if(consistent>=2){
+    if(!teamMode&&evidence.playerTeam&&evidence.variant===context.variant)emit('ntl:team-inferred',{team:evidence.playerTeam,reason:evidence.reason});
+    emit('ntl:context-evidence',{mapId:context.mapId,variant:evidence.variant||undefined,scenario:evidence.scenario||undefined,alternatives:evidence.alternatives,reason:evidence.reason,confidence:evidence.confidence});
+  }
 });
 window.addEventListener('ntl:context',()=>{const context=window.ntlMap.context();if(lastSession&&!lastSession.includes(`"${context.variant}"`))resetAirfields();lastRender='';renderAirfields();});
 export const airfieldSnapshot=()=>[...airfields.states.values()];

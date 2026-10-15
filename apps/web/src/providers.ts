@@ -10,7 +10,7 @@ async function getJson(url:string,signal:AbortSignal,headers?:HeadersInit){
 export function directProvider():Provider {
   const cache:RawFrame={at:0,mapInfo:null,objects:null,errors:{}};const last:Record<string,number>={};
   return async signal=>{
-    const now=Date.now(), entries=[['objects','map_obj.json',0],['mapInfo','map_info.json',2000],['state','state',1000],['indicators','indicators',3000],['mission','mission.json',3000]] as const;
+    const now=Date.now(), entries=[['objects','map_obj.json',0],['mapInfo','map_info.json',2000],['state','state',1000],['indicators','indicators',3000],['mission','mission.json',3000],['hud','hudmsg?lastEvt=0&lastDmg=0',1500]] as const;
     await Promise.all(entries.filter(([key,,cadence])=>!last[key]||now-last[key]>=cadence).map(async([key,path])=>{
       last[key]=now;
       try{cache[key]=await getJson(`http://127.0.0.1:8111/${path}`,signal);delete cache.errors![key];}

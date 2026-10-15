@@ -2,10 +2,10 @@
 
 This is a working field build, not a production-certified release.
 
-- Automatic scenario and side detection require distinct static-placement evidence; identical modern-era layouts leave BR ambiguous. The observed API has no reliable match maximum BR field. Manual BR/faction controls remain necessary, and the player's own aircraft BR is not used as a substitute.
+- Automatic scenario and side detection use static placements and exact English HUD unit names; identical signatures still leave BR ambiguous. The observed API has no reliable match maximum BR field. Manual BR/faction controls remain necessary, and the player's own aircraft BR is not used as a substitute.
 - Relative live colours use the observed default game colour convention. Customized game colours may make friendly/enemy inference incorrect. A faction name alone never determines hostility.
-- Individual kill, damage and repair events cannot be reliably tied to source components. Manual correction is provided; no disappearance-based destruction exists.
-- Static positional matching is conservative and inferred. It is opt-in after scenario/layout selection and excludes approximate/relocated positions. Same-position objects and different eras can be ambiguous.
+- A fresh English HUD kill can be associated with a unique recently missing component of the same model. The positional association is inferred, not a game-provided object identity. Duplicate candidates and old log history are not assigned. Disappearance alone means possibly destroyed. Units destroyed before the app observed them need manual confirmation.
+- Static positional matching is conservative and inferred. It is enabled by default and excludes approximate/relocated positions. Same-position objects and different eras can be ambiguous.
 - Convoy routes and source/destination data are real mission predictions. Generic observed ground tracks are shown separately. No automatic convoy identity or delivery completion is claimed. Convoy composition reference remains in the original legend; there is no verified live convoy component model.
 - The additional planner is an approximate air route with threat penalties. It does not guarantee safety or apply terrain masking/road constraints. Use original LOS/threat cover for separate terrain inspection. Source ranges omit game effects described by upstream.
 - Mission restoration timers are conditional estimates, not observed respawns. Unavailable rules display unknown. Completed timers never mark active.

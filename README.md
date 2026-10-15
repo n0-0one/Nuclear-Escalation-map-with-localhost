@@ -4,13 +4,13 @@ A standalone Nuclear Escalation map for War Thunder, available as a static websi
 
 **Original project:** [majorlier's interactive map](https://majorlier.github.io/nuclear-thunder-interactive-map/) · [source and documentation](https://github.com/majorlier/nuclear-thunder-interactive-map). Attribution and third-party notices are in [LICENSES/NOTICE.md](LICENSES/NOTICE.md). This is an independent community project and is not affiliated with Gaijin Entertainment.
 
-This is a field-test build. The local API does not reliably identify the current BR bracket, every vehicle, or every destruction event. Unknown data stays unknown and manual corrections remain available. See [the 0.2.0 verification record](docs/acceptance-0.2.0.md) for live, replay, synthetic and native evidence. The [0.1.0 record](docs/acceptance.md) is historical.
+This is a field-test build. The local API does not reliably identify the current BR bracket, every vehicle, or every destruction event. Unknown data stays unknown and manual corrections remain available. See [the 0.2.1 verification record](docs/acceptance-0.2.1.md) for live, replay, synthetic and native evidence. The [0.1.0 record](docs/acceptance.md) is historical.
 
 ## Start on Windows
 
 Download the Windows package or installer from [the Windows app repository's releases](https://github.com/n0-0one/Nuclear-Escalation-map-with-localhost-app/releases). Extract the complete ZIP, then run `Nuclear-Thunder-Live.exe`, or run `Nuclear-Thunder-Live-Setup.exe` to install it. Microsoft Edge WebView2 Runtime is required and is usually already present on Windows 11. The installer can download WebView2 if it is missing. Releases are not signed with a publisher certificate.
 
-The map and its assets are bundled with the application. **Native War Thunder** connects directly to the game running on this computer. The map also works when the game is closed. The desktop application does not need the optional bridge.
+The map and its assets are bundled with the application. From 0.2.1, validated mission-data updates download automatically at startup and every four hours, then load on the next launch. Settings shows the loaded revision and a manual update check. Offline startup uses verified cached or bundled data. **Native War Thunder** connects directly to the game running on this computer. The map also works when the game is closed. The desktop application does not need the optional bridge.
 
 Local build outputs are `target/release/ntl-desktop.exe`, `target/release/bundle/nsis/Nuclear Thunder Live_<version>_x64-setup.exe` and `target/release/ntl-bridge.exe`. Packaged releases are written to `release/<version>/`, including Windows, Web and Source ZIP files and `SHA256SUMS.txt`.
 
@@ -19,7 +19,7 @@ Local build outputs are `target/release/ntl-desktop.exe`, `target/release/bundle
 1. Choose **Archipelago** or **South Eastern City**, the battle's BR bracket and the correct side layout. Keep manual selection available when the game does not provide enough evidence to detect a setting.
 2. Use the original layers panel to show units, weapon ranges, terrain and roads. The original Measure, Line of sight, Flight brush and Threat cover tools are still available.
 3. Open **Battle controls** for the live connection, selected target, vehicle routes, battle history and settings. Collapse it when you want more room for the map.
-4. Select a site or search for it to inspect its components. Record a radar, launcher, vehicle or building as destroyed only when you have evidence. **Undo** reverses a manual change.
+4. Select a site or search for it to inspect its components. Automatic tracking shows active, explicitly destroyed and possibly destroyed components. A fresh HUD kill can be linked to one recently missing matching component; this association remains inferred. Mark whole site destroyed records your confirmation for every component. **Undo** reverses a manual change.
 5. Use target focus and the previous-view control to move between a selected contact and your earlier map position. Use route controls to inspect a route without losing the map context.
 6. Create a planned flight with 2–12 points. Unknown threats are included by default. The result is an estimate, not a guarantee of safe terrain clearance or concealment.
 
@@ -31,7 +31,7 @@ The live display uses player-relative contact information when it is available. 
 
 Select an aircraft and choose **Mark this aircraft as nuclear (manual)** when you have confirmed its role yourself. Automatic nuclear highlighting requires an explicit nuclear identifier from the game. A generic aircraft marker or model alone does not establish that it is carrying a nuclear weapon. Manual labels remain identified as manual and are tied to an estimated track that can lose continuity.
 
-Battle detection tries to match enough distinct static units and runway geometry before changing a setting. If two BR presets share the same visible placements, the bracket stays ambiguous. Enter the battle's maximum BR yourself in that case; side-layout detection can continue independently. Your own aircraft's BR is not treated as the match's maximum BR.
+Battle detection combines static placements, runway geometry and exact static-unit names in the English HUD log before changing a setting. Choose My faction when the default and mirrored layouts remain indistinguishable. If two BR presets share the same observed placements and unit names, the bracket stays ambiguous. Enter the battle's maximum BR yourself in that case; side-layout detection can continue independently. Your own aircraft's BR is not treated as the match's maximum BR.
 
 Battle export saves context, notes and states as JSON. Diagnostic export contains connection status, errors and basic metrics; it excludes pairing codes and HUD messages. The desktop writes a new timestamped file in Downloads. The website uses the browser's normal download flow.
 
@@ -108,7 +108,7 @@ The website repository is [n0-0one/Nuclear-Escalation-map-with-localhost](https:
 
 `.github/workflows/windows.yml` builds the Windows application and installer on `windows-latest`. Its artifacts contain the application, installer and third-party notices. Only a successful release workflow establishes that downloadable binaries were published; source commits alone do not.
 
-Map updates follow the upstream project's generated data and preserve source attribution. See [the datamine update process](docs/datamine.md) for the automation branch, review rules and pinned source revisions. Changes to generated data should be reviewed and tested before they reach the published application or website.
+Map updates follow the upstream project's generated data and preserve source attribution. See [the datamine update process](docs/datamine.md) for the automation branch, review rules and pinned source revisions. The validated JSON feed updates installed Windows copies without a new EXE. Source and website updates remain separate draft PRs for review.
 
 ## Verify and package a build
 
@@ -138,3 +138,5 @@ After building the website, desktop and bridge, and adding sources to Git, run `
 - [Known limitations](docs/limitations.md)
 - [Verification record](docs/acceptance.md)
 - [Attribution and third-party notices](LICENSES/NOTICE.md)
+
+Feature ideas are listed in [Proposed improvements](docs/suggestions.md); these are suggestions, not implemented features.

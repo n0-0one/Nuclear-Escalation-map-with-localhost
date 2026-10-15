@@ -171,6 +171,8 @@ def main() -> int:
         if args.commit:
             command += ["--commit", args.commit]
         subprocess.run(command, check=True, cwd=staging, env={**os.environ, "PYTHONUTF8": "1"}, timeout=2700)
+        from hud_names import enrich
+        enrich(staging)
         statistics = validate(staging)
         changed = import_candidate(staging, PUBLIC, apply=not args.check)
         revision = load(staging / "datamine-lock.json")["accepted_commit"]

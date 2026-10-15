@@ -1,8 +1,9 @@
 import type {MapId,NormalizedFrame,Observation,SiteData,WorldPoint} from './types';
 import {distance} from './coordinates';
+import {hudCombat,unitHudNames} from './hud';
 type Point={position:WorldPoint;icon:string;team:number;site:string;id:number};
-type Candidate={mapId:MapId;variant:string;scenario:string;grid:Map<string,Point[]>};
-export interface BattleEvidence {mapId:MapId;variant:string|null;scenario:string|null;playerTeam:0|1|2;matches:number;reason:string;confidence:'inferred'|'unknown';}
+type Candidate={mapId:MapId;variant:string;scenario:string;grid:Map<string,Point[]>;names:Set<string>};
+export interface BattleEvidence {mapId:MapId;variant:string|null;scenario:string|null;alternatives:string[];playerTeam:0|1|2;matches:number;reason:string;confidence:'inferred'|'unknown';}
 const cell=180,key=(p:WorldPoint)=>`${Math.floor(p.x/cell)},${Math.floor(p.z/cell)}`;
 const iconName=(name:string)=>({sam:'SAM',tracked:'MediumTank',tank:'MediumTank',wheeled:'Wheeled'}[name.toLowerCase()]||name).toLowerCase();
 
@@ -10,12 +11,13 @@ const iconName=(name:string)=>({sam:'SAM',tracked:'MediumTank',tank:'MediumTank'
 export class ScenarioMatcher {
   private candidates:Candidate[]=[];
   lastScores:{variant:string;scenario:string;team:number;matches:number;wrong:number;score:number}[]=[];
-  constructor(variants:Record<string,SiteData[]>,presets:{id:string}[],specs:(name:string)=>any){
+  constructor(variants:Record<string,SiteData[]>,presets:{id:string}[],specs:(name:string)=>any,displayName:(name:string)=>string=name=>name){
     for(const [variant,sites] of Object.entries(variants))for(const preset of presets){
-      const candidate:Candidate={mapId:variant.startsWith('city')?'city':'archipelago',variant,scenario:preset.id,grid:new Map()};let id=0;
+      const candidate:Candidate={mapId:variant.startsWith('city')?'city':'archipelago',variant,scenario:preset.id,grid:new Map(),names:new Set()};let id=0;
       for(const site of sites){
         if(site.runtime_relocated)continue;
         for(const item of [...(site.units_by_era?.[preset.id]||[]),...(site.buildings_by_era?.[preset.id]||[])]){
+          for(const name of unitHudNames(item.name,displayName(item.name),specs(item.name).hud_names||[]))candidate.names.add(name);
           if(item.unplaced||!Array.isArray(item.world_pos)||!item.world_pos.every(Number.isFinite))continue;
           const spec=specs(item.name),icon=/radar/i.test(item.role||'')?'Radar':spec.on_radar_as||'';
           if(!icon)continue;
@@ -28,7 +30,9 @@ export class ScenarioMatcher {
   }
   infer(frame:NormalizedFrame,mapId:MapId,knownTeam:0|1|2=0):BattleEvidence {
     const observations=frame.objects.filter(o=>o.type==='ground_model'&&!o.player&&o.kind!=='aiming-point'&&o.kind!=='point-of-interest').slice(0,700);
-    const scores=this.candidates.filter(c=>c.mapId===mapId).flatMap(candidate=>(knownTeam?[knownTeam]:[1,2]).map(team=>{
+    const candidates=this.candidates.filter(c=>c.mapId===mapId),knownNames=new Set(candidates.flatMap(c=>[...c.names]));
+    const seenNames=new Set((frame.hud||[]).flatMap(message=>{const combat=hudCombat(message);return combat?[combat.actor,combat.target].filter(name=>knownNames.has(name)):[];}));
+    const scores=candidates.flatMap(candidate=>(knownTeam?[knownTeam]:[1,2]).map(team=>{
       const used=new Set<number>(),sites=new Set<string>();let matches=0,wrong=0;
       for(const observation of observations){
         const x=Math.floor(observation.position.x/cell),z=Math.floor(observation.position.z/cell);let best:Point|undefined,bestDistance=130;
@@ -42,18 +46,23 @@ export class ScenarioMatcher {
         if((friendly&&best.team!==team)||(enemy&&best.team===team)){wrong++;continue;}
         matches++;sites.add(best.site);
       }
-      return {...candidate,team,matches,sites:sites.size,score:matches-wrong*2,wrong};
+      const incompatible=[...seenNames].filter(name=>!candidate.names.has(name)).length;
+      return {...candidate,team,matches,sites:sites.size,score:matches-wrong*2,wrong,incompatible};
     })).sort((a,b)=>b.score-a.score);
     this.lastScores=scores.map(({variant,scenario,team,matches,wrong,score})=>({variant,scenario,team,matches,wrong,score}));
-    const best=scores[0],next=scores[1];
-    const empty:BattleEvidence={mapId,variant:null,scenario:null,playerTeam:0,matches:best?.matches||0,confidence:'unknown',reason:'Not enough distinct static units to identify the battle. Select the bracket and sides manually.'};
+    const geometricBest=scores[0];
+    // HUD can distinguish otherwise identical radar signatures, but it cannot
+    // replace the multi-site geometric evidence or identify a player's faction.
+    const plausible=scores.filter(s=>geometricBest.score-s.score<Math.max(4,geometricBest.score*.12));
+    const compatible=seenNames.size?plausible.filter(s=>s.incompatible===0):plausible;
+    const equivalent=compatible.length?compatible:plausible,best=equivalent[0];
+    const empty:BattleEvidence={mapId,variant:null,scenario:null,alternatives:[],playerTeam:0,matches:best?.matches||0,confidence:'unknown',reason:'Not enough distinct static units to identify the battle. Select the bracket and sides manually.'};
     if(!best||best.matches<8||best.sites<3||best.score<6)return empty;
     // Require both an absolute and proportional lead; nearly identical eras remain manual.
-    const equivalent=scores.filter(s=>best.score-s.score<Math.max(4,best.score*.12));
     const unique=equivalent.every(s=>s.scenario===best.scenario);
     const variant=equivalent.every(s=>s.variant===best.variant)?best.variant:null;
     const playerTeam=equivalent.every(s=>s.team===best.team)?best.team as 1|2:0;
-    return {mapId,variant,scenario:unique?best.scenario:null,playerTeam,matches:best.matches,confidence:variant||unique||playerTeam?'inferred':'unknown',reason:`${best.matches} static units across ${best.sites} sites match${unique?'. Bracket inferred from mission placements.':'; bracket remains ambiguous.'}`};
+    return {mapId,variant,scenario:unique?best.scenario:null,alternatives:[...new Set(equivalent.map(s=>s.scenario))],playerTeam,matches:best.matches,confidence:variant||unique||playerTeam?'inferred':'unknown',reason:`${best.matches} static units across ${best.sites} sites match${unique?`. Bracket inferred from placements${compatible.length<plausible.length?' and HUD unit names':''}.`:'; several brackets share these radar signatures.'}${variant?'':' Choose your faction to resolve the mirrored side layout.'}`};
   }
 }
 

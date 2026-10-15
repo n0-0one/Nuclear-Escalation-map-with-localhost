@@ -11,7 +11,9 @@
     report.canvasPainted=document.querySelector('canvas').width>0;
     report.telemetryDenied=false;try{await api.invoke('telemetry_snapshot');}catch{report.telemetryDenied=true;}
     report.configureDenied=false;try{await api.invoke('configure_overlay',{clickThrough:true});}catch{report.configureDenied=true;}
-    report.success=report.summary?.includes('1 enemy vehicle groups')&&report.noIndependentMap&&report.canvasPainted&&report.telemetryDenied&&report.configureDenied;
+    report.updateDenied=false;try{await api.invoke('datamine_check');}catch{report.updateDenied=true;}
+    report.cacheDenied=false;try{await api.invoke('datamine_bootstrap');}catch{report.cacheDenied=true;}
+    report.success=report.summary?.includes('1 enemy vehicle groups')&&report.noIndependentMap&&report.canvasPainted&&report.telemetryDenied&&report.configureDenied&&report.updateDenied&&report.cacheDenied;
   }catch(error){report.error=String(error);}
   await api.invoke('plugin:event|emit',{event:'ntl:overlay-smoke-result',payload:report});
 })();

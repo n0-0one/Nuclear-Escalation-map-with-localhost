@@ -18,7 +18,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
       - run: npm test
-      - run: cargo test --locked -p war-thunder-telemetry -p ntl-bridge
+      - run: cargo test --locked -p war-thunder-telemetry -p ntl-bridge -p datamine-updater
       - run: npm run desktop:build
       - run: ./tests/integration/native-smoke.ps1
       - run: cargo build --locked --release -p ntl-bridge

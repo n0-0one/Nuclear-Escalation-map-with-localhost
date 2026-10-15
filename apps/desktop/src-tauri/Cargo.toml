@@ -1,6 +1,6 @@
 [package]
 name = "ntl-desktop"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 build = "build.rs"
 [features]
@@ -12,4 +12,5 @@ tauri = { version = "2", features = [] }
 tokio.workspace = true
 serde_json.workspace = true
 war-thunder-telemetry = { path = "../../../crates/war-thunder-telemetry" }
+datamine-updater = { path = "../../../crates/datamine-updater" }
 

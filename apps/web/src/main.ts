@@ -5,7 +5,9 @@ import type {Context,RawFrame,UnitRecord,Status,Source,Observation,WorldPoint,No
 import {STATUSES} from '../../../packages/core/types';
 import {worldToMap,distance} from '../../../packages/core/coordinates';
 import {normalize,recognizeMap,MatchLifecycle} from '../../../packages/core/telemetry';
-import {BattleStore,siteSummary,matchObservations,timerLabel} from '../../../packages/core/battle';
+import {BattleStore,siteSummary,timerLabel} from '../../../packages/core/battle';
+import {StaticTracker} from '../../../packages/core/static-tracker';
+import {dataUpdateSnapshot} from './data-updates';
 import {Poller} from '../../../packages/core/poller';
 import {catalog} from './engine';
 import {directProvider,bridgeProvider,nativeProvider,demoProvider} from './providers';
@@ -17,9 +19,11 @@ import './nearby-map';
 const engine=window.ntlMap,L=engine.L;
 const $=<T extends HTMLElement=HTMLElement>(id:string)=>document.getElementById(id) as T;
 const safe=(s:unknown)=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
+const presetLabel=(id:string)=>{const preset=engine.presets().find(p=>p.id===id);return preset?`${preset.label}${preset.rank_range?` · match max BR ${preset.rank_range.map(rank=>(1+rank/3).toFixed(1)).join('–')}`:''}`:id;};
 const native=!!window.__TAURI_INTERNALS__;
 const store=new BattleStore();let lifecycle=new MatchLifecycle();
 let units:UnitRecord[]=[],context:Context,selectedSite='',mode='manual',connected=false;
+let staticTracker=new StaticTracker([]),manualLayout='';
 let lastFrame:NormalizedFrame|null=null,rawFrame:RawFrame|null=null,lastSuccess:number|null=null;
 let detected= {mapId:null,confidence:'unknown',matches:0,reason:'No telemetry'} as ReturnType<typeof recognizeMap>;
 let applyingContext=false,previousView:{center:Leaflet.LatLng;zoom:number}|null=null;
@@ -37,7 +41,7 @@ function savePrefs(){preferences.mode=mode==='demo'?'manual':mode;preferences.fo
 const tracks=new LiveTracks(L,engine.map,()=>preferences,id=>selectTrack(id));
 
 document.body.insertAdjacentHTML('beforeend',`
-<div class="ntl-bar"><strong>NUCLEAR THUNDER LIVE</strong><span class="version">0.2 • LIVE MAP</span><span id="connection-pill" class="ntl-pill" role="status">MANUAL • OFFLINE</span><button id="open-nearby" title="Open a compact map of nearby activity">Nearby map</button><button id="open-live" aria-expanded="true">Battle controls</button></div>
+<div class="ntl-bar"><strong>NUCLEAR THUNDER LIVE</strong><span class="version">0.2.1 • LIVE MAP</span><span id="connection-pill" class="ntl-pill" role="status">MANUAL • OFFLINE</span><button id="open-nearby" title="Open a compact map of nearby activity">Nearby map</button><button id="open-live" aria-expanded="true">Battle controls</button></div>
 <aside class="ntl-panel" id="live-panel" aria-label="Live battle controls">
 <header><h2>BATTLE CONTROLS</h2><div class="ntl-header-actions"><button id="open-settings" aria-label="Open settings">Settings</button><button id="close-live" aria-label="Collapse live panel">−</button></div></header>
 <section><div class="row"><select id="connection-mode" aria-label="Connection mode"><option value="manual">Manual / offline</option>${native?'<option value="native">Native War Thunder</option>':''}<option value="direct">Direct localhost</option><option value="bridge">Local bridge</option><option value="demo">Simulation / demo</option></select><button id="connect-button">Connect</button></div>
@@ -53,14 +57,15 @@ document.body.insertAdjacentHTML('beforeend',`
 <label><input id="auto-context" type="checkbox" checked> Detect battle rating and side layout when possible</label>
 <label for="match-max-br">Match maximum battle rating</label><div class="row"><input id="match-max-br" type="number" min="1" max="18" step="0.1" placeholder="For example, 14.3" aria-label="Match maximum battle rating"><button id="apply-match-br">Apply BR</button></div><p class="ntl-muted">Use the highest BR shown for this match, not your aircraft's BR. Leave empty and Apply BR to restore automatic selection.</p>
 <label>My faction <select id="player-team"><option value="0">Automatic / unknown</option><option value="1">USSR / REDFOR</option><option value="2">NATO / BLUFOR</option></select></label>
-<label><input id="match-static" type="checkbox"> Match live contacts to map units</label>
+<label><input id="match-static" type="checkbox" checked> Track SAM and ground-unit states automatically</label>
+<p class="ntl-muted">A crossed-out unit has destruction evidence. An amber ? means it stopped reporting; it may be hidden. HUD kills are matched only to a unique recently missing component.</p>
 <p class="ntl-muted">Automatic choices require enough matching game data. If detection is uncertain, choose the battle rating and Swap sides in the map controls. Enemy contacts are always red.</p>
 <button id="reset-battle">Reset this battle</button></details>
 <details open><summary>Target & component states</summary>
 <input id="site-search" type="search" placeholder="Search SAM, radar, airfield, depot…" aria-label="Search sites">
 <select id="site-select" aria-label="Selected site"></select>
 <div class="row"><button id="focus-site">Focus target</button><button id="return-view">Previous view</button><button id="undo-status">Undo</button></div>
-<p id="site-summary" class="ntl-site-summary"></p><div id="unit-details" class="ntl-units"></div><button id="reset-site">Reset site to unknown</button>
+<p id="site-summary" class="ntl-site-summary"></p><div class="row"><button id="destroy-site">Mark whole site destroyed</button><button id="reset-site">Reset site to unknown</button></div><div id="unit-details" class="ntl-units"></div>
 </details>
 <details id="movement-section"><summary>Convoys & movement</summary>
 <label>Live contact <select id="track-select" aria-label="Selected live contact"><option value="">Select a moving contact…</option></select></label>
@@ -140,7 +145,8 @@ function receive(frame:RawFrame){
     window.dispatchEvent(new Event('ntl:battle-reset'));
     store.reset(transition==='start'?'Battle activity detected':'Map generation changed; new session');
     store.event('Battle identity inferred from local activity / map generation',mode==='demo'?'SIMULATED':'INFERRED');
-    $<HTMLInputElement>('match-static').checked=false;
+    staticTracker=new StaticTracker(units,name=>engine.displayName(name),name=>engine.specs(name).hud_names||[]);
+    if(transition==='change'){manualScenario='';manualLayout='';inferredTeam=0;$<HTMLInputElement>('match-max-br').value='';}
     clearObserved();clearRoute();refreshStates();
   }else if(transition==='end'){store.invalidateTimers();clearObserved();store.event('Battle ended (sustained inactive telemetry)',mode==='demo'?'SIMULATED':'INFERRED');}
   if(value.connected&&value.objects.length)lastSuccess=frame.at;
@@ -155,12 +161,8 @@ function receive(frame:RawFrame){
     drawPlayer(value.player,frame.at);
     tracks.update(value.objects.filter(o=>!o.player&&o.kind!=='objective'&&(preferences.showPoints||!o.kind||o.kind==='vehicle')),frame.at,context.mapId,preferences.pollInterval);
     const selected=tracks.get(selectedTrack);if(preferences.followSelected&&selected)engine.map.panTo(worldToMap(selected.observation.position,context.mapId),{animate:false});
-    const matches=$<HTMLInputElement>('match-static').checked?matchObservations(value.objects,units):[];matched=matches.length;
-    if($<HTMLInputElement>('match-static').checked) {
-      let changed=false;for(const match of matches)changed=store.set(match.unit,'REPORTED_ACTIVE',mode==='demo'?'SIMULATED':'INFERRED',frame.at)||changed;
-      if(changed)refreshStates();
-    }
-  } else {clearObserved();matched=0;}
+    if($<HTMLInputElement>('match-static').checked){if(staticTracker.update(value,store,Number($<HTMLSelectElement>('player-team').value)||inferredTeam))refreshStates();matched=staticTracker.matches;}else matched=0;
+  } else {staticTracker.update({...value,active:false},store);clearObserved();matched=0;}
   for(const [endpoint,error] of Object.entries(value.errors))diagnostic(`${endpoint}: ${error}`);
   if(mode==='demo')demoEvents();
   processingMs=performance.now()-start;updateStatus();renderTimeline();updateTrackControls();
@@ -203,12 +205,13 @@ $('manual-nuclear').onchange=()=>{tracks.setManualNuclear(selectedTrack,$<HTMLIn
 function onContext(){
   const next=engine.context();if(context&&(next.mapId!==context.mapId||next.variant!==context.variant||next.scenario!==context.scenario)){
     if(!applyingContext&&next.mapId!==context.mapId)$<HTMLInputElement>('auto-map').checked=false;
-    if(!applyingContext&&(next.variant!==context.variant||next.scenario!==context.scenario)){$<HTMLInputElement>('auto-context').checked=false;contextEvidence='Using your chosen battle rating and side layout.';}
-    $<HTMLInputElement>('match-static').checked=false;
+    if(!applyingContext){if(next.variant!==context.variant)manualLayout=next.variant;if(next.scenario!==context.scenario)manualScenario=next.scenario;contextEvidence='Your selected settings take precedence. Other settings can still be detected.';}
     store.event(`Selected ${next.mapId} / ${next.variant} / ${next.scenario}`,applyingContext?'INFERRED':'MANUAL');
     clearObserved();clearRoute();
   }
-  context=next;units=catalog(engine);engine.setPlayerTeam?.(Number($<HTMLSelectElement>('player-team').value)||inferredTeam);populateSites();renderConvoys();refreshStates();updateStatus();
+  const changed=!context||JSON.stringify(context)!==JSON.stringify(next);
+  context=next;units=catalog(engine);if(changed)staticTracker=new StaticTracker(units,name=>engine.displayName(name),name=>engine.specs(name).hud_names||[]);engine.setPlayerTeam?.(Number($<HTMLSelectElement>('player-team').value)||inferredTeam);populateSites();renderConvoys();refreshStates();updateStatus();
+  for(const option of $<HTMLSelectElement>('scenario-options').options)option.textContent=presetLabel(option.value);
 }
 function populateSites(){
   const query=$<HTMLInputElement>('site-search').value.toLowerCase(),select=$<HTMLSelectElement>('site-select');
@@ -239,18 +242,19 @@ $('focus-site').onclick=()=>{previousView={center:engine.map.getCenter(),zoom:en
 $('return-view').onclick=()=>{if(previousView)engine.map.setView(previousView.center,previousView.zoom);};
 $('undo-status').onclick=()=>{store.undo();refreshStates();};
 $('reset-site').onclick=()=>{for(const u of units.filter(u=>u.siteId===selectedSite))store.set(u,'UNKNOWN',mode==='demo'?'SIMULATED':'MANUAL');refreshStates();};
-$('reset-battle').onclick=()=>{window.dispatchEvent(new Event('ntl:battle-reset'));store.reset('Manual new battle');lifecycle=new MatchLifecycle();clearObserved();refreshStates();};
+$('destroy-site').onclick=()=>{for(const u of units.filter(u=>u.siteId===selectedSite))store.set(u,'DESTROYED',mode==='demo'?'SIMULATED':'MANUAL');refreshStates();};
+$('reset-battle').onclick=()=>{window.dispatchEvent(new Event('ntl:battle-reset'));store.reset('Manual new battle');staticTracker=new StaticTracker(units,name=>engine.displayName(name),name=>engine.specs(name).hud_names||[]);lifecycle=new MatchLifecycle();clearObserved();refreshStates();};
 $('player-team').onchange=()=>{preferences.team=Number($<HTMLSelectElement>('player-team').value);const team=preferences.team||inferredTeam;engine.setPlayerTeam?.(team);if(team)$<HTMLSelectElement>('threat-team').value=String(team===1?2:1);store.event(`My faction: ${$<HTMLSelectElement>('player-team').selectedOptions[0].textContent}`);populateSites();renderTimeline();savePrefs();window.dispatchEvent(new CustomEvent('ntl:team-mode',{detail:{team:preferences.team}}));};
-$('match-static').onchange=()=>{store.event(`Static matching ${$<HTMLInputElement>('match-static').checked?'enabled for manually selected scenario/layout':'disabled'}`);renderTimeline();};
+$('match-static').onchange=()=>{staticTracker=new StaticTracker(units,name=>engine.displayName(name),name=>engine.specs(name).hud_names||[]);store.event(`Automatic unit states ${$<HTMLInputElement>('match-static').checked?'enabled':'disabled'}`);renderTimeline();};
 $('follow-player').onchange=()=>{if($<HTMLInputElement>('follow-player').checked){preferences.followSelected=false;$<HTMLInputElement>('follow-track').checked=false;}savePrefs();};$('show-observed').onchange=()=>{clearObserved();savePrefs();};
 $('show-history').onchange=()=>{preferences.trails=$<HTMLInputElement>('show-history').checked;tracks.refresh();savePrefs();};
 engine.map.on('dragstart',()=>{$<HTMLInputElement>('follow-player').checked=false;$<HTMLInputElement>('follow-track').checked=false;preferences.followSelected=false;savePrefs();});
 window.addEventListener('ntl:context',onContext);window.addEventListener('ntl:select',event=>selectSite((event as CustomEvent<string>).detail));
 window.addEventListener('ntl:team-inferred',event=>{const evidence=(event as CustomEvent<{team:number;reason:string}>).detail;inferredTeam=evidence.team;if(!Number($<HTMLSelectElement>('player-team').value)){engine.setPlayerTeam?.(inferredTeam);populateSites();if(inferredTeam)$<HTMLSelectElement>('threat-team').value=String(inferredTeam===1?2:1);}diagnostic(evidence.reason);});
-window.addEventListener('ntl:context-evidence',event=>{const evidence=(event as CustomEvent<{mapId?:Context['mapId'];variant?:string;scenario?:string;reason?:string}>).detail;contextEvidence=manualScenario?'Battle rating selected manually. '+(evidence.reason||'Checking side layout.'):evidence.reason||'Checking battle data.';const scenario=manualScenario||evidence.scenario;if($<HTMLInputElement>('auto-context').checked&&context&&(evidence.variant&&evidence.variant!==context.variant||scenario&&scenario!==context.scenario)){
-  applyingContext=true;engine.setContext(evidence.mapId||context.mapId,evidence.variant||context.variant,scenario||context.scenario);applyingContext=false;
+window.addEventListener('ntl:context-evidence',event=>{const evidence=(event as CustomEvent<{mapId?:Context['mapId'];variant?:string;scenario?:string;alternatives?:string[];reason?:string}>).detail;const alternatives=!evidence.scenario?evidence.alternatives?.map(id=>engine.presets().find(p=>p.id===id)?.label||id).join(' / '):'';contextEvidence=(manualScenario?'Battle rating selected manually. ':'')+(evidence.reason||'Checking battle data.')+(alternatives?` Possible presets: ${alternatives}.`:'');const scenario=manualScenario||evidence.scenario,variant=manualLayout||evidence.variant;if($<HTMLInputElement>('auto-context').checked&&context&&(variant&&variant!==context.variant||scenario&&scenario!==context.scenario)){
+  applyingContext=true;engine.setContext(evidence.mapId||context.mapId,variant||context.variant,scenario||context.scenario);applyingContext=false;
 }updateStatus();});
-$('auto-context').onchange=()=>{contextEvidence=$<HTMLInputElement>('auto-context').checked?'Checking game data for battle rating and side layout.':'Using your chosen battle rating and side layout.';updateStatus();};
+$('auto-context').onchange=()=>{if($<HTMLInputElement>('auto-context').checked){manualScenario='';manualLayout='';$<HTMLInputElement>('match-max-br').value='';}contextEvidence=$<HTMLInputElement>('auto-context').checked?'Checking game data for battle rating and side layout.':'Using your chosen battle rating and side layout.';updateStatus();};
 $('apply-match-br').onclick=()=>{const input=$<HTMLInputElement>('match-max-br');if(!input.value.trim()){manualScenario='';$<HTMLInputElement>('auto-context').checked=true;contextEvidence='Checking game data for battle rating and side layout.';updateStatus();return;}const br=Number(input.value),rank=Math.round((br-1)*3),preset=engine.presets().find(p=>p.rank_range&&rank>=p.rank_range[0]&&rank<=p.rank_range[1]);if(!Number.isFinite(br)||br<1||br>18||!preset){input.setCustomValidity('Enter a match maximum BR covered by the available scenarios (1.0 to 17.7).');input.reportValidity();return;}input.setCustomValidity('');manualScenario=preset.id;applyingContext=true;engine.setContext(context.mapId,context.variant,preset.id);applyingContext=false;contextEvidence=`Maximum match BR ${br.toFixed(1)} selected manually. Side detection remains available.`;store.event(`Match maximum BR set to ${br.toFixed(1)} (${preset.label})`);updateStatus();};
 $('match-max-br').oninput=()=>{$<HTMLInputElement>('match-max-br').setCustomValidity('');};
 
@@ -311,11 +315,11 @@ function updateStatus(){
   if(previousStatus!==status){if(mode!=='manual')store.event(status,mode==='demo'?'SIMULATED':'TELEMETRY');previousStatus=status;}
   $('connection-detail').textContent=mode==='manual'?'Static map • manual operation. No live data.':!lastFrame?.connected?(mode==='direct'?'Connection failed: game unavailable or browser blocked localhost. Try the paired bridge or desktop app.':'Waiting for local telemetry. Requests retry automatically.'):
     `${mode.toUpperCase()} · ${lastFrame.objects.length} observed objects · ${stale?'STALE':lastSuccess?new Date(lastSuccess).toLocaleTimeString():'No current player position'}${lastFrame.unsupported?' · Some endpoints unavailable':''}`;
-  if(context){const text=`${context.mapId==='city'?'South Eastern City':'Archipelago'} · ${engine.presets().find(p=>p.id===context.scenario)?.label||context.scenario} · ${context.variant.includes('mirror')?'swapped sides':'default sides'}. ${contextEvidence}`;if($('identification').textContent!==text)$('identification').textContent=text;}
+  if(context){const text=`${context.mapId==='city'?'South Eastern City':'Archipelago'} · ${presetLabel(context.scenario)} · ${context.variant.includes('mirror')?'swapped sides':'default sides'}. ${contextEvidence}`;if($('identification').textContent!==text)$('identification').textContent=text;}
   if(stale&&playerMarker)playerMarker.setOpacity(.3);
   if($('diagnostics').closest('details')?.open&&performance.now()-lastDiagnosticsAt>1000){lastDiagnosticsAt=performance.now();$('diagnostics').textContent=JSON.stringify(diagnosticSnapshot(),null,2);}
 }
-function diagnosticSnapshot(){return {version:'0.2.0',mode,connection:lastFrame?.connected||false,activity:lastFrame?.active??null,session:lifecycle.session,selected:context,recognized:detected,lastSuccess,pollingMs:poller.interval,processingMs:Math.round(processingMs*100)/100,observed:lastFrame?.objects.length||0,liveTracks:tracks.snapshot().length,trackComparisons:tracks.comparisonCount,trackedComponents:units.length,confirmedIdentityMatches:0,inferredPositionCandidates:matched,matchingEnabled:$<HTMLInputElement>('match-static').checked,contextEvidence,errors:lastFrame?.errors||{},warnings:['Automatic battle settings require sufficient evidence; manual choices take precedence.','A generation change is an inferred session boundary, not a confirmed battle ID.','No missing object is considered destroyed.']};}
+function diagnosticSnapshot(){return {version:'0.2.1',mode,connection:lastFrame?.connected||false,activity:lastFrame?.active??null,session:lifecycle.session,selected:context,recognized:detected,lastSuccess,pollingMs:poller.interval,processingMs:Math.round(processingMs*100)/100,observed:lastFrame?.objects.length||0,hudMessages:lastFrame?.hud?.length||0,liveTracks:tracks.snapshot().length,trackComparisons:tracks.comparisonCount,trackedComponents:units.length,confirmedIdentityMatches:0,inferredPositionCandidates:matched,matchingEnabled:$<HTMLInputElement>('match-static').checked,contextEvidence,errors:lastFrame?.errors||{},warnings:['Automatic battle settings require sufficient evidence; manual choices take precedence.','A generation change is an inferred session boundary, not a confirmed battle ID.','Disappearance alone means possibly destroyed. HUD-to-position links are inferred.']};}
 async function exportJson(name:string,value:unknown){
   const content=JSON.stringify(value,null,2);
   if(native){try{const path=await invoke<string>('export_json',{kind:name.includes('diagnostics')?'diagnostics':'battle',content});diagnostic(`Export saved: ${path}`);$('connection-detail').textContent=`Saved to ${path}`;}catch(error){diagnostic(`Export failed: ${error}`);$('connection-detail').textContent=`Export failed: ${error}`;}return;}
@@ -330,6 +334,6 @@ function demoEvents(){demoTick++;if(!lastFrame?.active)return;const sam=units.fi
 }
 const timer=setInterval(()=>{updateStatus();document.querySelectorAll<HTMLElement>('[data-timer]').forEach(el=>{const state=store.get(el.dataset.timer!);if(state.status==='DESTROYED')el.textContent=timerLabel(state);});},1000);
 window.addEventListener('beforeunload',()=>{poller.stop();clearInterval(timer);routeWorker?.terminate();tracks.clear();});
-window.ntlApp={snapshot:()=>({...diagnosticSnapshot(),airfields:airfieldSnapshot(),preferences:{...preferences},liveContacts:tracks.snapshot(),unitStates:Object.fromEntries(store.units),events:store.events,playerMarker:playerMarker?.getLatLng()||null})};
+window.ntlApp={snapshot:()=>({...diagnosticSnapshot(),dataUpdates:dataUpdateSnapshot(),airfields:airfieldSnapshot(),preferences:{...preferences},liveContacts:tracks.snapshot(),unitStates:Object.fromEntries(store.units),events:store.events,playerMarker:playerMarker?.getLatLng()||null})};
 if(engine.ready){onContext();if(native)startConnection();}
 else window.addEventListener('ntl:context',()=>{if(native&&!connected)startConnection();},{once:true});

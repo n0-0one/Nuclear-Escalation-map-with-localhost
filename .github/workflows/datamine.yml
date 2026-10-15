@@ -41,6 +41,8 @@ jobs:
           python scripts/datamine/tools/test_mission_extraction.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/datamine/test_update.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/datamine/test_feed.py
       - name: Regenerate mission data from a pinned datamine revision
         id: datamine
         env:
@@ -58,13 +60,17 @@ jobs:
             Get-Content '.local/datamine-update-report.md' | Add-Content $env:GITHUB_STEP_SUMMARY
           }
       - run: npm ci
-        if: steps.datamine.outputs.changed == 'true'
       - run: npm test
-        if: steps.datamine.outputs.changed == 'true'
       - run: npm run build
-        if: steps.datamine.outputs.changed == 'true'
       - run: npm run test:browser
-        if: steps.datamine.outputs.changed == 'true'
+      - name: Package validated data for installed Windows apps
+        run: python scripts/datamine/build_feed.py
+      - uses: actions/upload-artifact@v6
+        with:
+          name: validated-windows-data
+          path: .local/windows-feed/
+          include-hidden-files: true
+          retention-days: 14
       - name: Create a patch containing only generated data
         if: steps.datamine.outputs.changed == 'true'
         run: python scripts/datamine/package_patch.py
@@ -117,7 +123,7 @@ jobs:
             - Only the twelve allowlisted JSON data files are included. Our live renderer, interface and desktop integration are preserved.
             - Read the [generation report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) and preview the changed scenarios before merging.
 
-            This follows majorlier's draft-update workflow. Merging publishes the web update through the normal main branch checks. Windows distributions require a new build/release.
+            This follows majorlier's draft-update workflow. Merging publishes the web update through the normal main branch checks. Windows 0.2.1 and later automatically download the separately validated JSON feed, without a new executable.
           add-paths: |
             apps/web/public/map_data.json
             apps/web/public/map_data_mirror.json
@@ -131,3 +137,25 @@ jobs:
             apps/web/public/unit_specs.json
             apps/web/public/unit_display_names.json
             apps/web/public/datamine-lock.json
+
+  publish_windows_data:
+    needs: generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v6
+        with:
+          name: validated-windows-data
+          path: .local/windows-feed
+      - name: Publish the immutable JSON pack and current manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/datamine/publish_feed.mjs

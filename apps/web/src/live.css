@@ -16,3 +16,5 @@
 @media(min-width:1500px){.ntl-panel{width:390px}.ntl-units{max-height:350px}}
 @media(max-width:900px){.ntl-bar .version{display:none}.ntl-bar{gap:8px}.ntl-bar strong{font-size:11px;letter-spacing:.5px}}
 @media(max-width:600px){.ntl-bar strong{font-size:0;letter-spacing:0}.ntl-bar strong::after{content:'NT LIVE';font-size:10px;white-space:nowrap}.ntl-bar{padding:0 6px;gap:5px}.ntl-bar button{font-size:10px;padding:6px;white-space:nowrap}.ntl-bar .ntl-pill{font-size:9px;max-width:95px;overflow:hidden;text-overflow:ellipsis}.ntl-panel{max-height:58dvh}.ntl-panel h2{font-size:12px}.ntl-panel .row{flex-wrap:wrap}}
+.leaflet-marker-icon[data-ntl-status="POSSIBLY_DESTROYED"] { opacity:.55; filter:sepia(.7); }
+.leaflet-marker-icon[data-ntl-status="POSSIBLY_DESTROYED"]::after { content:'?'; position:absolute; right:-4px; top:-8px; color:#ffcc66; font-size:16px; font-weight:900; text-shadow:0 1px 3px #000; }

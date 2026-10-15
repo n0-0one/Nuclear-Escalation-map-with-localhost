@@ -5,6 +5,8 @@
   "windows": ["main"],
   "permissions": [
     "allow-telemetry-snapshot",
+    "allow-datamine-bootstrap",
+    "allow-datamine-check",
     "allow-export-json",
     "allow-native-smoke-complete",
     "allow-open-overlay",
